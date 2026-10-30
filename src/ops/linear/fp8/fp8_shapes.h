@@ -11,6 +11,8 @@ struct Fp8LinearShape {
     // Split-K partial bytes an A8 call of up to max_tokens columns needs (the unified TMA
     // tail-wave routes); null where the shape has none.
     std::size_t (*partial_capacity_bytes)(std::int32_t max_tokens) = nullptr;
+    // FP32 out on the A16 schedules; null where an FP32 result takes the runtime-shape route.
+    Fp8Launch a16_fp32 = nullptr;
 };
 
 extern const Fp8LinearShape kFp8N14336K5120;

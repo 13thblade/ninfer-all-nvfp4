@@ -1,7 +1,7 @@
 #pragma once
 
 // Implements: include/ninfer/ops/target_logprobs.h
-// Match: contiguous BF16 [physical_rows,C], I32 [C], and FP32 [C].
+// Match: contiguous BF16 or FP32 [physical_rows,C], I32 [C], and FP32 [C].
 // Algorithm assumptions: one 256-thread CTA performs a single-pass online logsumexp per column.
 
 #include "ops/common/warp.cuh"
@@ -14,6 +14,13 @@
 namespace ninfer::ops {
 
 inline constexpr int kTargetLogprobsBlock = 256;
+
+// Logits are BF16, or FP32 where the head writes its unrounded sums.
+__device__ __forceinline__ float logprob_logit(__nv_bfloat16 value) {
+    return __bfloat162float(value);
+}
+
+__device__ __forceinline__ float logprob_logit(float value) { return value; }
 
 template <int BlockSize>
 __device__ __forceinline__ float target_logprobs_block_max(float value) {
@@ -38,11 +45,10 @@ __device__ __forceinline__ float target_logprobs_block_max(float value) {
     return result;
 }
 
-template <int BlockSize>
+template <int BlockSize, typename Logit>
 __launch_bounds__(BlockSize) __global__
-    void target_logprobs_kernel(const __nv_bfloat16* logits, const std::int32_t* target_ids,
-                                float* output, std::int32_t valid_rows,
-                                std::int32_t physical_rows) {
+    void target_logprobs_kernel(const Logit* logits, const std::int32_t* target_ids, float* output,
+                                std::int32_t valid_rows, std::int32_t physical_rows) {
     const std::int32_t column = static_cast<std::int32_t>(blockIdx.x);
     const std::int64_t base   = static_cast<std::int64_t>(column) * physical_rows;
 
@@ -52,7 +58,7 @@ __launch_bounds__(BlockSize) __global__
     // thread's subsequence NaN-poisons local_sum through expf(-inf - -inf).
     for (std::int32_t row = static_cast<std::int32_t>(threadIdx.x); row < valid_rows;
          row += BlockSize) {
-        const float value   = __bfloat162float(logits[base + row]);
+        const float value   = logprob_logit(logits[base + row]);
         const float new_max = fmaxf(local_max, value);
         if (new_max > local_max) {
             local_sum *= expf(local_max - new_max);
@@ -66,7 +72,7 @@ __launch_bounds__(BlockSize) __global__
     __shared__ float warp_sums[BlockSize / kWarpSize];
     const float sum = block_reduce_sum<BlockSize>(local_sum, warp_sums);
     if (threadIdx.x == 0) {
-        const float target = __bfloat162float(logits[base + target_ids[column]]);
+        const float target = logprob_logit(logits[base + target_ids[column]]);
         output[column]     = target - maximum - logf(sum);
     }
 }

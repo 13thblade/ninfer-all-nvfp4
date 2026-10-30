@@ -6,9 +6,19 @@
 #include "ops/linear/fp8/fp8_a16_sliced_k_mma.cuh"
 #include "ops/linear/fp8/fp8_a16_mma.cuh"
 
+#include <type_traits>
+
 namespace ninfer::ops::detail::unified {
 namespace {
-template <int ActiveTokens>
+// BF16 logits, or FP32: the head's sums unrounded, on the same schedules.
+template <class Output>
+Output head_output(Tensor& out) {
+    using Value =
+        std::conditional_t<std::is_same_v<Output, LinearFp32Output>, float, __nv_bfloat16>;
+    return {static_cast<Value*>(out.data), Fp8N248320K5120::kOutputRows};
+}
+
+template <class Output, int ActiveTokens>
 void launch_tile(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     using Geometry = Fp8N248320K5120;
     // Above 16 columns each 16-row CTA re-reads more activation bytes from L2 than it streams
@@ -18,20 +28,20 @@ void launch_tile(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_
                                  ActiveTokens, ActiveTokens <= 8 ? 1 : 2, Cache::ca, Cache::cg,
                                  Fp8ActivationStage::ActiveOnly, 1, (ActiveTokens > 16 ? 2 : 1)>;
     static_assert((Geometry::kInputRows % Schedule::kBlockK) == 0);
-    const LinearBf16Output output{static_cast<__nv_bfloat16*>(out.data), Geometry::kOutputRows};
     launch_fp8_a16_sliced_k_mma<Fp8ScheduleInstance<Schedule, Geometry::kInputRows, ActiveTokens>>(
-        fp8_a16_operands(x, weight), output, LinearIdentityEpilogue{}, stream, {},
+        fp8_a16_operands(x, weight), head_output<Output>(out), LinearIdentityEpilogue{}, stream, {},
         pdl::Dependency::Programmatic);
 }
 
+template <class Output>
 void launch_ksplit(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     const int tokens = x.ne[1];
-    if (tokens <= 8) return launch_tile<8>(x, weight, out, stream);
-    if (tokens <= 16) return launch_tile<16>(x, weight, out, stream);
-    if (tokens <= 24) return launch_tile<24>(x, weight, out, stream);
-    if (tokens <= 32) return launch_tile<32>(x, weight, out, stream);
-    if (tokens <= 40) return launch_tile<40>(x, weight, out, stream);
-    if (tokens <= 48) return launch_tile<48>(x, weight, out, stream);
+    if (tokens <= 8) return launch_tile<Output, 8>(x, weight, out, stream);
+    if (tokens <= 16) return launch_tile<Output, 16>(x, weight, out, stream);
+    if (tokens <= 24) return launch_tile<Output, 24>(x, weight, out, stream);
+    if (tokens <= 32) return launch_tile<Output, 32>(x, weight, out, stream);
+    if (tokens <= 40) return launch_tile<Output, 40>(x, weight, out, stream);
+    if (tokens <= 48) return launch_tile<Output, 48>(x, weight, out, stream);
     throw std::logic_error("fp8 K-split exceeds shape capacity");
 }
 
@@ -42,38 +52,38 @@ using Main128 = Fp8A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>;
 using Tail64  = Fp8A16MmaSchedule<128, 64, 64, 64, 16, 2, 2>;
 using Tail96  = Fp8A16MmaSchedule<64, 96, 64, 64, 16, 2, 2>;
 
-template <class Schedule>
+template <class Output, class Schedule>
 void launch_schedule(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     launch_fp8_a16_mma<Fp8ScheduleInstance<Schedule, 5120>>(
-        fp8_a16_operands(x, weight),
-        LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), weight.n}, LinearIdentityEpilogue{},
-        stream);
+        fp8_a16_operands(x, weight), head_output<Output>(out), LinearIdentityEpilogue{}, stream);
 }
 
+template <class Output>
 void launch_tail(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     if (x.ne[1] < 42) {
-        launch_ksplit(x, weight, out, stream);
+        launch_ksplit<Output>(x, weight, out, stream);
     } else if (x.ne[1] <= Tail64::kBlockTokens) {
-        launch_schedule<Tail64>(x, weight, out, stream);
+        launch_schedule<Output, Tail64>(x, weight, out, stream);
     } else {
-        launch_schedule<Tail96>(x, weight, out, stream);
+        launch_schedule<Output, Tail96>(x, weight, out, stream);
     }
 }
 
+template <class Output>
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
-    if (x.ne[1] < 42) return launch_ksplit(x, weight, out, stream);
+    if (x.ne[1] < 42) return launch_ksplit<Output>(x, weight, out, stream);
 
     const std::int32_t tokens = x.ne[1];
     if (tokens <= Tail64::kBlockTokens) {
-        launch_schedule<Tail64>(x, weight, out, stream);
+        launch_schedule<Output, Tail64>(x, weight, out, stream);
         return;
     }
     if (tokens <= Tail96::kBlockTokens) {
-        launch_schedule<Tail96>(x, weight, out, stream);
+        launch_schedule<Output, Tail96>(x, weight, out, stream);
         return;
     }
     if (tokens <= Main128::kBlockTokens) {
-        launch_schedule<Main128>(x, weight, out, stream);
+        launch_schedule<Output, Main128>(x, weight, out, stream);
         return;
     }
 
@@ -81,28 +91,29 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t
     // plus a tail launch. Beyond 384 tokens the main schedule's higher full-tile throughput has
     // amortized this packing effect.
     if ((tokens >= 161 && tokens <= 192) || (tokens >= 257 && tokens <= 288)) {
-        launch_schedule<Tail96>(x, weight, out, stream);
+        launch_schedule<Output, Tail96>(x, weight, out, stream);
         return;
     }
 
     const std::int32_t tail = tokens % Main128::kBlockTokens;
     if (tail == 0 || tail > Tail96::kBlockTokens) {
-        launch_schedule<Main128>(x, weight, out, stream);
+        launch_schedule<Output, Main128>(x, weight, out, stream);
         return;
     }
 
     const std::int32_t prefix = tokens - tail;
     const Tensor input_prefix = x.slice(1, 0, prefix);
     Tensor output_prefix      = out.slice(1, 0, prefix);
-    launch_schedule<Main128>(input_prefix, weight, output_prefix, stream);
+    launch_schedule<Output, Main128>(input_prefix, weight, output_prefix, stream);
 
     const Tensor input_tail = x.slice(1, prefix, tail);
     Tensor output_tail      = out.slice(1, prefix, tail);
-    launch_tail(input_tail, weight, output_tail, stream);
+    launch_tail<Output>(input_tail, weight, output_tail, stream);
 }
 
 bool uses_a8(std::int32_t, std::int32_t) { return false; }
 } // namespace
 
-const Fp8LinearShape kFp8N248320K5120{248320, 5120, launch_a16, nullptr, uses_a8};
+const Fp8LinearShape kFp8N248320K5120{248320,  5120,    launch_a16<LinearBf16Output>, nullptr,
+                                      uses_a8, nullptr, launch_a16<LinearFp32Output>};
 } // namespace ninfer::ops::detail::unified

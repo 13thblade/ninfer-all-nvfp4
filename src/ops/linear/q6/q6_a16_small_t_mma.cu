@@ -73,13 +73,20 @@ __device__ __forceinline__ unsigned decode_pair(unsigned word, unsigned high, in
     return *reinterpret_cast<const unsigned*>(&value);
 }
 
-template <int Tiles>
+__device__ __forceinline__ void store_output(__nv_bfloat16* out, float value) {
+    *out = __float2bfloat16_rn(value);
+}
+
+__device__ __forceinline__ void store_output(float* out, float value) { *out = value; }
+
+// Out is BF16, or FP32 for the vocabulary head's unrounded logits.
+template <int Tiles, typename Out>
 __global__ void __launch_bounds__(kWarps * 32)
     q6_small_t_mma_kernel(const __nv_bfloat16* __restrict__ x,
                           const std::uint8_t* __restrict__ codes,
                           const std::uint8_t* __restrict__ high_bits,
-                          const std::uint8_t* __restrict__ scales, __nv_bfloat16* __restrict__ out,
-                          int n, int k, int padded_groups, int tokens) {
+                          const std::uint8_t* __restrict__ scales, Out* __restrict__ out, int n,
+                          int k, int padded_groups, int tokens) {
     __shared__ float partial[kWarps][Tiles][32][4];
 
     const int lane           = static_cast<int>(threadIdx.x) & 31;
@@ -186,7 +193,7 @@ __global__ void __launch_bounds__(kWarps * 32)
         const int token = j * 8 + 2 * (l & 3) + (c & 1);
         const int row   = row0 + (l >> 2) + 8 * (c >> 1);
         if (token < tokens && row < n) {
-            out[static_cast<std::int64_t>(token) * n + row] = __float2bfloat16_rn(sum);
+            store_output(out + static_cast<std::int64_t>(token) * n + row, sum);
         }
     }
 }
@@ -200,11 +207,18 @@ void launch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) 
         w.padded_shape[1] % kGroupK != 0) {
         throw std::invalid_argument("q6 small-T mma: unsupported token count, N or K");
     }
-    q6_small_t_mma_kernel<Tiles><<<n / kRows, kWarps * 32, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
-        static_cast<const std::uint8_t*>(w.qhigh), static_cast<const std::uint8_t*>(w.scales),
-        static_cast<__nv_bfloat16*>(out.data), n, k, static_cast<int>(w.padded_shape[1] / kGroupK),
-        tokens);
+    const auto run = [&]<typename Out>() {
+        q6_small_t_mma_kernel<Tiles, Out><<<n / kRows, kWarps * 32, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+            static_cast<const std::uint8_t*>(w.qhigh), static_cast<const std::uint8_t*>(w.scales),
+            static_cast<Out*>(out.data), n, k, static_cast<int>(w.padded_shape[1] / kGroupK),
+            tokens);
+    };
+    if (out.dtype == DType::FP32) {
+        run.template operator()<float>();
+    } else {
+        run.template operator()<__nv_bfloat16>();
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

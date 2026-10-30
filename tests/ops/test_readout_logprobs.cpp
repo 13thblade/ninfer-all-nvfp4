@@ -9,6 +9,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 using namespace ninfer;
@@ -73,38 +74,57 @@ std::vector<std::uint16_t> make_extreme_logits(std::int32_t physical_rows, std::
     return logits;
 }
 
-std::vector<double> readout_oracle(const std::vector<std::uint16_t>& logits,
+// FP32 logits at 1/16384 steps, finer than BF16 holds at these magnitudes.
+std::vector<float> make_fine_logits(std::int32_t physical_rows, std::int32_t valid_rows) {
+    std::vector<float> logits(static_cast<std::size_t>(physical_rows), 96.0f);
+    for (std::int32_t row = 0; row < valid_rows; ++row) {
+        const std::uint32_t mixed = static_cast<std::uint32_t>(row) * 1664525u + 1013904223u;
+        logits[static_cast<std::size_t>(row)] =
+            -24.0f + static_cast<float>(mixed % 786432u) * (1.0f / 16384.0f);
+    }
+    return logits;
+}
+
+// The value a stored logit represents: BF16 bits or an FP32 value.
+double represented(std::uint16_t bits) { return static_cast<double>(bf16_to_f32(bits)); }
+
+double represented(float value) { return static_cast<double>(value); }
+
+template <typename Logit>
+std::vector<double> readout_oracle(const std::vector<Logit>& logits,
                                    const std::vector<std::int32_t>& ids, std::int32_t valid_rows) {
     double maximum = -std::numeric_limits<double>::infinity();
     for (std::int32_t row = 0; row < valid_rows; ++row) {
-        maximum = std::max(maximum, static_cast<double>(bf16_to_f32(logits[row])));
+        maximum = std::max(maximum, represented(logits[row]));
     }
     double sum = 0.0;
     for (std::int32_t row = 0; row < valid_rows; ++row) {
-        sum += std::exp(static_cast<double>(bf16_to_f32(logits[row])) - maximum);
+        sum += std::exp(represented(logits[row]) - maximum);
     }
     std::vector<double> expected(ids.size());
     for (std::size_t k = 0; k < ids.size(); ++k) {
-        expected[k] = static_cast<double>(bf16_to_f32(logits[ids[k]])) - maximum - std::log(sum);
+        expected[k] = represented(logits[ids[k]]) - maximum - std::log(sum);
     }
     return expected;
 }
 
+template <typename Logit>
 int run_case(const std::string& label, std::int32_t physical_rows, std::int32_t valid_rows,
-             std::int32_t count, std::int32_t capacity, const std::vector<std::uint16_t>& logits) {
+             std::int32_t count, std::int32_t capacity, const std::vector<Logit>& logits) {
     const auto ids      = make_ids(valid_rows, count);
     const auto expected = readout_oracle(logits, ids, valid_rows);
+    const DType dtype   = std::is_same_v<Logit, float> ? DType::FP32 : DType::BF16;
     std::vector<std::int32_t> stored_ids(static_cast<std::size_t>(capacity), -7);
     std::copy(ids.begin(), ids.end(), stored_ids.begin());
 
-    GuardedDeviceBuffer device_logits(logits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_logits(logits.size() * sizeof(Logit));
     GuardedDeviceBuffer device_ids(stored_ids.size() * sizeof(std::int32_t));
     GuardedDeviceBuffer device_output(static_cast<std::size_t>(capacity) * sizeof(float));
     device_logits.copy_from_host(logits.data(), device_logits.bytes());
     device_ids.copy_from_host(stored_ids.data(), device_ids.bytes());
     device_output.fill(0xcd);
 
-    Tensor logits_tensor(device_logits.data(), DType::BF16, {physical_rows});
+    Tensor logits_tensor(device_logits.data(), dtype, {physical_rows});
     Tensor ids_tensor(device_ids.data(), DType::I32, {capacity});
     Tensor output_tensor(device_output.data(), DType::FP32, {capacity});
     ops::readout_logprobs(logits_tensor, ids_tensor, count, valid_rows, output_tensor, nullptr);
@@ -122,9 +142,8 @@ int run_case(const std::string& label, std::int32_t physical_rows, std::int32_t 
             break;
         }
     }
-    failures +=
-        verify_exact((label + " preserves logits").c_str(),
-                     from_device<std::uint16_t>(device_logits.data(), logits.size()), logits);
+    failures += verify_exact((label + " preserves logits").c_str(),
+                             from_device<Logit>(device_logits.data(), logits.size()), logits);
     failures += verify_exact((label + " preserves ids").c_str(),
                              from_device<std::int32_t>(device_ids.data(), stored_ids.size()),
                              stored_ids);
@@ -221,6 +240,10 @@ int main() {
                          make_uniform_logits(13, 1, -7.0f));
     failures += run_case("readout_logprobs extreme finite logits", 4099, 4093, 32, 32,
                          make_extreme_logits(4099, 4093));
+    failures += run_case("readout_logprobs FP32 full vocabulary 32 ids", 248320, 248077, 32, 32,
+                         make_fine_logits(248320, 248077));
+    failures += run_case("readout_logprobs FP32 non-aligned rows, one id", 523, 509, 1, 32,
+                         make_fine_logits(523, 509));
     failures += run_validation_cases();
 
     std::cout << (failures ? "FAIL" : "OK") << " readout_logprobs\n";

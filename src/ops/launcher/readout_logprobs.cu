@@ -10,10 +10,18 @@ namespace ninfer::ops::detail {
 
 void readout_logprobs_launch(const Tensor& logits, const Tensor& token_ids, std::int32_t count,
                              std::int32_t valid_rows, Tensor& output, cudaStream_t stream) {
-    readout_logprobs_kernel<kReadoutLogprobsBlock><<<1, kReadoutLogprobsBlock, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(logits.data),
-        static_cast<const std::int32_t*>(token_ids.data), static_cast<float*>(output.data), count,
-        valid_rows);
+    const auto launch = [&]<typename Logit>() {
+        readout_logprobs_kernel<kReadoutLogprobsBlock, Logit>
+            <<<1, kReadoutLogprobsBlock, 0, stream>>>(
+                static_cast<const Logit*>(logits.data),
+                static_cast<const std::int32_t*>(token_ids.data), static_cast<float*>(output.data),
+                count, valid_rows);
+    };
+    if (logits.dtype == DType::FP32) {
+        launch.template operator()<float>();
+    } else {
+        launch.template operator()<__nv_bfloat16>();
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

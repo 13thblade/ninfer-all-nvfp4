@@ -11,6 +11,8 @@ struct ShapeEntry {
     Q4Launch (*select)(std::int32_t);
     // The unified-template table; shapes without one keep the legacy routes everywhere.
     Q4Launch (*unified)(std::int32_t) = nullptr;
+    // FP32 out on the widths it names; the runtime-shape route elsewhere.
+    Q4Launch (*fp32)(std::int32_t) = nullptr;
 };
 
 constexpr std::array kShapes{
@@ -25,7 +27,7 @@ constexpr std::array kShapes{
     ShapeEntry{34816, 5120, select_q4_n34816_k5120, select_q4_n34816_k5120_unified},
     ShapeEntry{131072, 5120, select_q4_n131072_k5120, select_q4_n131072_k5120_unified},
     ShapeEntry{131072, 2048, select_q4_n131072_k2048, select_q4_n131072_k2048_unified},
-    ShapeEntry{248320, 5120, select_q4_n248320_k5120},
+    ShapeEntry{248320, 5120, select_q4_n248320_k5120, nullptr, select_q4_n248320_k5120_fp32},
     ShapeEntry{3456, 1152, select_q4_n3456_k1152, select_q4_n3456_k1152_unified},
     ShapeEntry{4304, 1152, select_q4_n4304_k1152, select_q4_n4304_k1152_unified},
 };
@@ -49,10 +51,18 @@ Q4Launch select_q4_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
     return select_q4_a16_launch(n, k, t);
 }
 
+Q4Launch select_q4_fp32_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
+    for (const auto& entry : kShapes) {
+        if (entry.n != n || entry.k != k || entry.fp32 == nullptr) continue;
+        if (const Q4Launch launch = entry.fp32(t)) { return launch; }
+    }
+    return select_q4_general_launch(t, DType::FP32);
+}
+
 void q4_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,
                  cudaStream_t stream) {
     const Q4Launch launch = out.dtype == DType::FP32
-                                ? select_q4_general_launch(x.ne[1], DType::FP32)
+                                ? select_q4_fp32_launch(weight.n, weight.k, x.ne[1])
                                 : select_q4_launch(weight.n, weight.k, x.ne[1], policy);
     launch(x, weight, out, stream);
 }

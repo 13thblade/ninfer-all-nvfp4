@@ -21,8 +21,15 @@
 
 namespace ninfer::models::qwen3_5::detail {
 
-using TensorLayout                              = TensorRegion;
-inline constexpr std::uint32_t kCausalScoreTile = 1024;
+using TensorLayout = TensorRegion;
+
+// Columns a causal-scoring flush projects through the head: 1024, or 512 with FP32 logits, so the
+// logits tile keeps its bytes.
+inline constexpr std::uint32_t kCausalScoreMaximumTile = 1024;
+
+[[nodiscard]] constexpr std::uint32_t causal_score_tile(DType logits) noexcept {
+    return logits == DType::FP32 ? kCausalScoreMaximumTile / 2 : kCausalScoreMaximumTile;
+}
 
 struct DFlashPersistentLayout {
     std::optional<qwen3_5::PagedKVCacheLayout> full;

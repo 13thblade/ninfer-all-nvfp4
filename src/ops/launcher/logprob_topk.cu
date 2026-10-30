@@ -29,11 +29,16 @@ void logprob_topk_launch(const Tensor& logits, const SamplingConfig* configs,
     auto* top    = reinterpret_cast<LogprobCandidate*>(sums + partials);
     const auto* flag = static_cast<const std::int32_t*>(active.data);
 
-    logprob_topk_partials_kernel<<<dim3(static_cast<unsigned int>(split),
-                                        static_cast<unsigned int>(rows)),
-                                   kLogprobTopkBlock, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(logits.data), configs, drafts, columns, token_domain,
-        logits.ne[0], split, flag, maxima, sums, top);
+    const dim3 grid(static_cast<unsigned int>(split), static_cast<unsigned int>(rows));
+    if (logits.dtype == DType::FP32) {
+        logprob_topk_partials_kernel<float><<<grid, kLogprobTopkBlock, 0, stream>>>(
+            static_cast<const float*>(logits.data), configs, drafts, columns, token_domain,
+            logits.ne[0], split, flag, maxima, sums, top);
+    } else {
+        logprob_topk_partials_kernel<__nv_bfloat16><<<grid, kLogprobTopkBlock, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(logits.data), configs, drafts, columns, token_domain,
+            logits.ne[0], split, flag, maxima, sums, top);
+    }
     CUDA_CHECK(cudaGetLastError());
     logprob_topk_combine_kernel<<<static_cast<unsigned int>(rows), kLogprobTopkBlock, 0, stream>>>(
         maxima, sums, top, split, flag, static_cast<std::int32_t*>(top_ids.data),

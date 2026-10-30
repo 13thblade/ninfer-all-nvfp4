@@ -43,6 +43,11 @@ void require_dtype(const Tensor& t, DType dtype, const char* op, const char* nam
     require_contiguous_nonnull(t, op, name);
 }
 
+// Verification logits are BF16, or FP32 where the head writes its unrounded sums.
+DType logits_dtype(const Tensor& logits) {
+    return logits.dtype == DType::FP32 ? DType::FP32 : DType::BF16;
+}
+
 void require_scalar(const Tensor& t, DType dtype, const char* op, const char* name) {
     require_dtype(t, dtype, op, name);
     if (t.ne[0] != 1 || t.ne[1] != 1 || t.ne[2] != 1 || t.ne[3] != 1) {
@@ -194,7 +199,7 @@ void speculative_accept_coupled_drafts(const Tensor& target_tokens, const Tensor
     if (batch < 1) {
         throw std::invalid_argument("speculative_accept_coupled_drafts: B must be >=1");
     }
-    require_dtype(logits, DType::BF16, op, "logits");
+    require_dtype(logits, logits_dtype(logits), op, "logits");
     if (column_starts != nullptr) {
         require_vector(*column_starts, DType::I32, batch, op, "column_starts");
         const std::int32_t columns = target_tokens.ne[0];
@@ -260,7 +265,8 @@ void speculative_accept_sparse_drafts(
         throw std::invalid_argument("speculative_accept_sparse_drafts: K>31 requires B=1");
     }
     require_matrix(target_tokens, DType::I32, columns, batch, op, "target_tokens");
-    require_tensor3(logits, DType::BF16, kSparsePhysicalRows, columns, batch, op, "logits");
+    require_tensor3(logits, logits_dtype(logits), kSparsePhysicalRows, columns, batch, op,
+                    "logits");
     require_matrix(drafts, DType::I32, k, batch, op, "drafts");
     require_tensor3(candidate_ids, DType::I32, kSparseCandidates, k, batch, op, "candidate_ids");
     require_tensor3(proposal_q, DType::FP32, kSparseCandidates, k, batch, op, "proposal_q");

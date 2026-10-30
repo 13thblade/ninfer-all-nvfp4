@@ -34,6 +34,8 @@ struct RoundStateSpec {
     std::uint32_t verify_window  = 0;
     SpeculativeBackend backend   = SpeculativeBackend::None;
     bool causal_scoring          = false;
+    // The head's logits: FP32 where its format writes the unrounded sums, else BF16.
+    DType logits_dtype = DType::BF16;
 };
 
 // Stable pinned/device transfer format for ordinary decode. The full fixed-size object is copied

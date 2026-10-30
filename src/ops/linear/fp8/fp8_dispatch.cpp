@@ -57,6 +57,12 @@ void fp8_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPoli
     validate_fp8_weight(weight, "fp8 linear");
     if (x.ne[1] <= 0) throw std::invalid_argument("fp8 linear: T must be positive");
     const bool registered = fp8_registered(weight.n, weight.k);
+    if (out.dtype == DType::FP32 && registered) {
+        const auto& shape = resolve_shape(
+            weight.n, weight.k, policy,
+            linear_route_table(LinearRouteFamily::Fp8, x.ne[1], fp8_wide_route_table(policy)));
+        if (shape.a16_fp32 != nullptr) return shape.a16_fp32(x, weight, out, stream);
+    }
     if (out.dtype == DType::FP32 || !registered) {
         if (!valid_linear_policy(policy)) throw std::invalid_argument("fp8 linear: unsupported policy");
         if (!registered && allows_a8(policy) && fp8_general_uses_a8(x.ne[1])) {

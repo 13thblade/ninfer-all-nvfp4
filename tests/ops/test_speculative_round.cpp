@@ -36,6 +36,41 @@ DeviceBuffer device_config(const ops::SamplingConfig& config) {
     return to_device(std::vector<ops::SamplingConfig>{config});
 }
 
+// The acceptance cases' logits run as BF16, or with --fp32-logits as FP32 holding the same values.
+bool g_fp32_logits = false;
+
+DType logits_dtype() { return g_fp32_logits ? DType::FP32 : DType::BF16; }
+
+std::size_t logit_bytes() { return g_fp32_logits ? sizeof(float) : sizeof(std::uint16_t); }
+
+std::vector<float> logit_values(const std::vector<std::uint16_t>& bits) {
+    std::vector<float> values(bits.size());
+    for (std::size_t i = 0; i < bits.size(); ++i) { values[i] = bf16_to_f32(bits[i]); }
+    return values;
+}
+
+DeviceBuffer upload_logits(const std::vector<std::uint16_t>& bits) {
+    return g_fp32_logits ? to_device(logit_values(bits)) : to_device(bits);
+}
+
+void copy_logits(DeviceBuffer& device, const std::vector<std::uint16_t>& bits) {
+    if (g_fp32_logits) {
+        const std::vector<float> values = logit_values(bits);
+        device.copy_from_host(values.data(), values.size() * sizeof(float));
+    } else {
+        device.copy_from_host(bits.data(), bits.size() * sizeof(std::uint16_t));
+    }
+}
+
+// The device logits as BF16 bits; FP32 logits hold BF16 values, so the conversion is exact.
+std::vector<std::uint16_t> download_logits(const DeviceBuffer& device, std::size_t count) {
+    if (!g_fp32_logits) { return from_device<std::uint16_t>(device, count); }
+    const std::vector<float> values = from_device<float>(device, count);
+    std::vector<std::uint16_t> bits(count);
+    for (std::size_t i = 0; i < count; ++i) { bits[i] = f32_to_bf16(values[i]); }
+    return bits;
+}
+
 int prepare_verify_case(int k, int batch) {
     const int width = k + 1;
     std::vector<std::int32_t> anchors(batch), lengths(batch), extents(batch), drafts(k * batch);
@@ -525,7 +560,7 @@ struct SparseAcceptSuite {
                                        initial_lengths, host_configs, token_counts, mtp_onehot);
 
         DeviceBuffer d_target_tokens                    = to_device(target_tokens);
-        DeviceBuffer d_logits                           = to_device(logits);
+        DeviceBuffer d_logits                           = upload_logits(logits);
         DeviceBuffer d_drafts                           = to_device(drafts);
         DeviceBuffer d_candidate_ids                    = to_device(candidate_ids);
         DeviceBuffer d_proposal_q                       = to_device(proposal_q);
@@ -560,7 +595,7 @@ struct SparseAcceptSuite {
         d_accepted.fill(0xab);
 
         Tensor target_tensor(d_target_tokens.p, DType::I32, {kSparseColumns, kSparseBatch});
-        Tensor logits_tensor(d_logits.p, DType::BF16,
+        Tensor logits_tensor(d_logits.p, logits_dtype(),
                              {kSparsePhysicalRows, kSparseColumns, kSparseBatch});
         Tensor drafts_tensor(d_drafts.p, DType::I32, {kSparseDrafts, kSparseBatch});
         Tensor candidate_tensor(d_candidate_ids.p, DType::I32,
@@ -676,8 +711,7 @@ struct SparseAcceptSuite {
                                         replay_q[base + (rank + 1) % 16] = 0.25f;
                                     }
                         }
-                        d_logits.copy_from_host(replay_logits.data(),
-                                                replay_logits.size() * sizeof(std::uint16_t));
+                        copy_logits(d_logits, replay_logits);
                         d_proposal_q.copy_from_host(replay_q.data(),
                                                     replay_q.size() * sizeof(float));
                     }
@@ -699,10 +733,9 @@ struct SparseAcceptSuite {
                         next_lengths, host_configs, token_counts, mtp_onehot);
                     failures += check_result(wanted, " replay " + std::to_string(pass));
                     if (change_inputs) {
-                        failures += verify_exact(
-                            "replay logits readonly",
-                            from_device<std::uint16_t>(d_logits, current_logits.size()),
-                            current_logits);
+                        failures += verify_exact("replay logits readonly",
+                                                 download_logits(d_logits, current_logits.size()),
+                                                 current_logits);
                         failures += verify_exact("replay q readonly",
                                                  from_device<float>(d_proposal_q, current_q.size()),
                                                  current_q);
@@ -717,8 +750,8 @@ struct SparseAcceptSuite {
             }
             cuda_check(cudaStreamDestroy(stream), "destroy sparse graph stream");
         }
-        failures += verify_exact("sparse logits readonly",
-                                 from_device<std::uint16_t>(d_logits, logits.size()), logits);
+        failures += verify_exact("sparse logits readonly", download_logits(d_logits, logits.size()),
+                                 logits);
         failures +=
             verify_exact("sparse targets readonly",
                          from_device<int>(d_target_tokens, target_tokens.size()), target_tokens);
@@ -1188,7 +1221,7 @@ int execute_accept_case(const std::string& label, const std::vector<std::int32_t
                         const AcceptExpected& expected) {
     const int k              = static_cast<int>(drafts.size());
     DeviceBuffer d_targets   = to_device(target_tokens);
-    DeviceBuffer d_logits    = to_device(logits_bits);
+    DeviceBuffer d_logits    = upload_logits(logits_bits);
     DeviceBuffer d_drafts    = to_device(drafts);
     DeviceBuffer d_counts    = to_device(initial_token_counts);
     config.token_counts      = static_cast<std::int32_t*>(d_counts.p);
@@ -1208,7 +1241,7 @@ int execute_accept_case(const std::string& label, const std::vector<std::int32_t
     initialize(d_accepted, std::vector<std::int32_t>{-13});
 
     Tensor targets(d_targets.p, DType::I32, {k + 1});
-    Tensor logits(d_logits.p, DType::BF16, {physical_rows, k + 1});
+    Tensor logits(d_logits.p, logits_dtype(), {physical_rows, k + 1});
     Tensor draft_tensor(d_drafts.p, DType::I32, {k});
     Tensor extent(d_extent.p, DType::I32, {1});
     Tensor length(d_length.data(), DType::I32, {1});
@@ -1239,7 +1272,7 @@ int execute_accept_case(const std::string& label, const std::vector<std::int32_t
         verify_exact((label + " target tokens unchanged").c_str(),
                      from_device<std::int32_t>(d_targets, target_tokens.size()), target_tokens);
     failures += verify_exact((label + " logits unchanged").c_str(),
-                             from_device<std::uint16_t>(d_logits, logits_bits.size()), logits_bits);
+                             download_logits(d_logits, logits_bits.size()), logits_bits);
     failures += verify_exact((label + " drafts unchanged").c_str(),
                              from_device<std::int32_t>(d_drafts, drafts.size()), drafts);
     failures += verify_exact((label + " config unchanged").c_str(),
@@ -1386,7 +1419,7 @@ int coupled_sample_case(int token_domain, int k, int mismatch) {
     config.min_p       = 0.01f;
     config.seed        = 0xC0FFEEull + static_cast<std::uint64_t>(k);
 
-    DeviceBuffer d_logits = to_device(logits);
+    DeviceBuffer d_logits = upload_logits(logits);
     DeviceBuffer d_config = device_config(config);
     DeviceBuffer d_out    = to_device<std::int32_t>({0});
     WorkspaceArena workspace(
@@ -1394,9 +1427,9 @@ int coupled_sample_case(int token_domain, int k, int mismatch) {
     std::vector<std::int32_t> drawn(static_cast<std::size_t>(k + 1));
     for (int column = 0; column <= k; ++column) {
         DeviceBuffer d_position = to_device<std::int32_t>({initial_length + column + 1});
-        const Tensor rows(static_cast<std::uint16_t*>(d_logits.p) +
-                              static_cast<std::size_t>(column) * token_domain,
-                          DType::BF16, {token_domain, 1});
+        const Tensor rows(static_cast<std::uint8_t*>(d_logits.p) +
+                              static_cast<std::size_t>(column) * token_domain * logit_bytes(),
+                          logits_dtype(), {token_domain, 1});
         Tensor out(d_out.p, DType::I32, {1});
         const Tensor position(d_position.p, DType::I32, {1});
         ops::sample(rows, out, token_domain, static_cast<const ops::SamplingConfig*>(d_config.p),
@@ -1542,7 +1575,7 @@ int batched_sampling_workspace_stride_case() {
     }
 
     DeviceBuffer d_targets = to_device(winners);
-    DeviceBuffer d_logits  = to_device(logits);
+    DeviceBuffer d_logits  = upload_logits(logits);
     DeviceBuffer d_drafts  = to_device(drafts);
     DeviceBuffer d_extents = to_device<std::int32_t>({k, k});
     DeviceBuffer d_lengths = to_device<std::int32_t>({100, 200});
@@ -1558,7 +1591,7 @@ int batched_sampling_workspace_stride_case() {
     DeviceBuffer d_configs = to_device(configs);
 
     Tensor targets(d_targets.p, DType::I32, {columns, batch});
-    Tensor logits_tensor(d_logits.p, DType::BF16, {physical_rows, columns, batch});
+    Tensor logits_tensor(d_logits.p, logits_dtype(), {physical_rows, columns, batch});
     Tensor draft_tensor(d_drafts.p, DType::I32, {k, batch});
     Tensor extents(d_extents.p, DType::I32, {batch});
     Tensor lengths(d_lengths.p, DType::I32, {batch});
@@ -1608,7 +1641,7 @@ int packed_columns_case(bool sampled, int token_domain) {
     }
     const int packed = static_cast<int>(winners.size());
     DeviceBuffer d_targets = to_device(winners);
-    DeviceBuffer d_logits  = to_device(logits);
+    DeviceBuffer d_logits  = upload_logits(logits);
     DeviceBuffer d_drafts  = to_device(drafts);
     DeviceBuffer d_starts  = to_device(starts);
     DeviceBuffer d_extents = to_device<std::int32_t>({widths[0] - 1, widths[1] - 1});
@@ -1625,7 +1658,7 @@ int packed_columns_case(bool sampled, int token_domain) {
     const std::vector<ops::SamplingConfig> configs{config, config};
     DeviceBuffer d_configs = to_device(configs);
     Tensor targets(d_targets.p, DType::I32, {packed});
-    Tensor logits_tensor(d_logits.p, DType::BF16, {physical_rows, packed});
+    Tensor logits_tensor(d_logits.p, logits_dtype(), {physical_rows, packed});
     Tensor draft_tensor(d_drafts.p, DType::I32, {k, batch});
     Tensor column_starts(d_starts.p, DType::I32, {batch});
     Tensor extents(d_extents.p, DType::I32, {batch});
@@ -1825,7 +1858,7 @@ int onehot_distribution_case(int k, bool graph, bool mtp_onehot = false, int for
         ids[i] = static_cast<int>(i % 16);
         q[i]   = i % 16 == 0 ? 1.0F : 0.0F;
     }
-    auto d_logits = to_device(logits);
+    auto d_logits = upload_logits(logits);
     auto d_ids    = to_device(ids);
     auto d_q      = to_device(q);
     auto d_zero   = to_device(zero);
@@ -1850,7 +1883,7 @@ int onehot_distribution_case(int k, bool graph, bool mtp_onehot = false, int for
     counts.fill(0);
     accepted.fill(0);
     Tensor target(d_zero.p, DType::I32, {width, batch});
-    Tensor target_logits(d_logits.p, DType::BF16, {kSparsePhysicalRows, width, batch});
+    Tensor target_logits(d_logits.p, logits_dtype(), {kSparsePhysicalRows, width, batch});
     Tensor drafts(d_drafts.p, DType::I32, {k, batch});
     Tensor candidates(d_ids.p, DType::I32, {16, k, batch});
     Tensor proposal_q(d_q.p, DType::FP32, {16, k, batch});
@@ -2043,6 +2076,12 @@ int main(int argc, char** argv) {
         std::cout << "speculative_round: SKIP (CUDA unavailable)\n";
         return 77;
     }
+    // A leading --fp32-logits runs the selected cases on FP32 logits.
+    if (argc >= 2 && std::string_view(argv[1]) == "--fp32-logits") {
+        g_fp32_logits = true;
+        --argc;
+        ++argv;
+    }
 
     if (argc == 2 && std::string_view(argv[1]) == "--wide-accept") {
         int failures     = 0;
@@ -2153,7 +2192,7 @@ int main(int argc, char** argv) {
         return failures == 0 ? 0 : 1;
     }
     if (argc > 2 || (argc == 2 && std::string_view(argv[1]) != "--transforms-only")) {
-        std::cerr << "usage: ninfer_speculative_round_test "
+        std::cerr << "usage: ninfer_speculative_round_test [--fp32-logits] "
                      "[--transforms-only|--ngram-only|--onehot-distribution|--mtp-onehot|--mtp-"
                      "distribution|--ngram-negative-penalties|--wide-accept|--wide-distribution]\n";
         return 2;

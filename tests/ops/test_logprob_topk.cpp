@@ -39,10 +39,12 @@ struct CaseSpec {
     bool counts                = false;
     bool mask                  = false;
     bool ties                  = false;
+    // FP32 logits, unrounded; BF16 otherwise.
+    bool fp32 = false;
 };
 
 struct Inputs {
-    std::vector<float> logits;              // BF16-represented, [physical, columns, batch]
+    std::vector<float> logits;              // the represented values, [physical, columns, batch]
     std::vector<std::int32_t> counts;       // [token_domain, batch]
     std::vector<std::int32_t> drafts;       // [columns - 1, batch]
     std::vector<std::uint32_t> masks;       // [words, columns, batch]
@@ -58,7 +60,8 @@ Inputs make_inputs(const CaseSpec& spec, std::uint32_t seed) {
     for (std::size_t r = 0; r < rows; ++r) {
         for (std::int32_t v = 0; v < spec.physical_rows; ++v) {
             const float value = spec.ties ? static_cast<float>((v + r) % 5) : logit(rng);
-            in.logits[r * spec.physical_rows + v] = bf16_to_f32(f32_to_bf16(value));
+            in.logits[r * spec.physical_rows + v] =
+                spec.fp32 ? value : bf16_to_f32(f32_to_bf16(value));
         }
     }
     if (spec.counts) {
@@ -101,7 +104,7 @@ struct Oracle {
     std::vector<double> lse;          // [columns, batch]
 };
 
-// Independent FP64 evaluation of the contract over the BF16-represented inputs.
+// Independent FP64 evaluation of the contract over the represented inputs.
 Oracle oracle(const CaseSpec& spec, const Inputs& in) {
     Oracle out;
     const std::size_t rows = static_cast<std::size_t>(spec.columns) * spec.batch;
@@ -187,10 +190,15 @@ int run_case(const std::string& label, const CaseSpec& spec, std::uint32_t seed)
     DeviceBuffer config_buffer(configs.size() * sizeof(ops::SamplingConfig));
     config_buffer.copy_from_host(configs.data(), config_buffer.bytes);
 
-    std::vector<std::uint16_t> packed(in.logits.size());
+    std::vector<std::uint16_t> packed(spec.fp32 ? 0 : in.logits.size());
     for (std::size_t i = 0; i < packed.size(); ++i) { packed[i] = f32_to_bf16(in.logits[i]); }
-    GuardedDeviceBuffer logits(packed.size() * sizeof(std::uint16_t));
-    logits.copy_from_host(packed.data(), logits.bytes());
+    GuardedDeviceBuffer logits(spec.fp32 ? in.logits.size() * sizeof(float)
+                                         : packed.size() * sizeof(std::uint16_t));
+    if (spec.fp32) {
+        logits.copy_from_host(in.logits.data(), logits.bytes());
+    } else {
+        logits.copy_from_host(packed.data(), logits.bytes());
+    }
     GuardedDeviceBuffer ids(rows * K * sizeof(std::int32_t));
     GuardedDeviceBuffer values(rows * K * sizeof(float));
     GuardedDeviceBuffer lse(rows * sizeof(float));
@@ -201,7 +209,8 @@ int run_case(const std::string& label, const CaseSpec& spec, std::uint32_t seed)
     values.fill(0xcd);
     lse.fill(0xcd);
 
-    Tensor logits_tensor(logits.data(), DType::BF16, {spec.physical_rows, spec.columns, spec.batch});
+    Tensor logits_tensor(logits.data(), spec.fp32 ? DType::FP32 : DType::BF16,
+                         {spec.physical_rows, spec.columns, spec.batch});
     Tensor ids_tensor(ids.data(), DType::I32, {K, spec.columns, spec.batch});
     Tensor values_tensor(values.data(), DType::FP32, {K, spec.columns, spec.batch});
     Tensor lse_tensor(lse.data(), DType::FP32, {spec.columns, spec.batch});
@@ -436,6 +445,16 @@ int main() {
     failures += run_case("greedy rows", {.batch = 4, .temperature = 0.0f}, 13u);
     failures += run_case("penalties", {.batch = 8, .presence = 0.5f, .frequency = 0.3f, .counts = true}, 14u);
     failures += run_case("token masks", {.batch = 8, .mask = true}, 15u);
+    failures +=
+        run_case("FP32 eight rows at T=0.7", {.batch = 8, .temperature = 0.7f, .fp32 = true}, 21u);
+    failures += run_case("FP32 penalties and masks",
+                         {.batch     = 8,
+                          .presence  = 0.5f,
+                          .frequency = 0.3f,
+                          .counts    = true,
+                          .mask      = true,
+                          .fp32      = true},
+                         22u);
     failures += run_case("ties", {.physical_rows = 4096, .token_domain = 4096, .ties = true}, 16u);
     failures += run_case("smallest domain", {.physical_rows = 20, .token_domain = 20, .batch = 3}, 17u);
     failures += run_case("split boundary 128", {.physical_rows = 128, .token_domain = 128, .batch = 2}, 18u);

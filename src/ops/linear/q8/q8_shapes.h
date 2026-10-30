@@ -46,6 +46,8 @@ using Q8N248320K5120 = Q8LinearGeometry<248320, 5120>;
 [[nodiscard]] Q8Launch select_q8_n17408_k5120(std::int32_t tokens);
 [[nodiscard]] Q8Launch select_q8_n34816_k5120(std::int32_t tokens);
 [[nodiscard]] Q8Launch select_q8_n248320_k5120(std::int32_t tokens);
+// The vocabulary head's FP32 logits on its K-split widths; null beyond them.
+[[nodiscard]] Q8Launch select_q8_n248320_k5120_fp32(std::int32_t tokens);
 
 // Unified-template tables of the upstream shapes.
 [[nodiscard]] Q8Launch select_q8_n1024_k2048_unified(std::int32_t tokens);

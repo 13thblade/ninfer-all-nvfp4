@@ -17,17 +17,17 @@ namespace ninfer::ops {
 
 inline constexpr int kReadoutLogprobsBlock = 1024;
 
-template <int BlockSize>
+template <int BlockSize, typename Logit>
 __launch_bounds__(BlockSize) __global__
-    void readout_logprobs_kernel(const __nv_bfloat16* logits, const std::int32_t* token_ids,
-                                 float* output, std::int32_t count, std::int32_t valid_rows) {
+    void readout_logprobs_kernel(const Logit* logits, const std::int32_t* token_ids, float* output,
+                                 std::int32_t count, std::int32_t valid_rows) {
     float local_max = -CUDART_INF_F;
     float local_sum = 0.0f;
     // Requires finite logits (see readout_logprobs.h): -inf before any finite value in a
     // thread's subsequence NaN-poisons local_sum through expf(-inf - -inf).
     for (std::int32_t row = static_cast<std::int32_t>(threadIdx.x); row < valid_rows;
          row += BlockSize) {
-        const float value   = __bfloat162float(logits[row]);
+        const float value   = logprob_logit(logits[row]);
         const float new_max = fmaxf(local_max, value);
         if (new_max > local_max) {
             local_sum *= expf(local_max - new_max);
@@ -44,9 +44,7 @@ __launch_bounds__(BlockSize) __global__
     const float sum        = block_reduce_sum<BlockSize>(local_sum, warp_sums);
     const float lse        = maximum + logf(__shfl_sync(kFullWarpMask, sum, 0));
     const auto k           = static_cast<std::int32_t>(threadIdx.x);
-    if (k < count) {
-        output[k] = __bfloat162float(logits[token_ids[k]]) - lse;
-    }
+    if (k < count) { output[k] = logprob_logit(logits[token_ids[k]]) - lse; }
 }
 
 } // namespace ninfer::ops

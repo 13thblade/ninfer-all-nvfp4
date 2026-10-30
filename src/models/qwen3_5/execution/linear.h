@@ -14,6 +14,13 @@ namespace ninfer::models::qwen3_5::execution {
     return head.weight.qtype == QType::BF16 || is_gguf(head.weight.qtype);
 }
 
+// The dtype of the vocabulary head's logits, which the sampler, argmax, draft acceptance,
+// logprobs and scoring read: FP32, the unrounded sums, where the head's format writes them. BF16
+// rounding turns near-equal logits into exact ties that the token id then breaks.
+[[nodiscard]] inline DType target_logits_dtype(const LinearParameters& head) {
+    return ops::linear_writes_fp32(head.weight.qtype) ? DType::FP32 : DType::BF16;
+}
+
 inline void project(const Tensor& input, const LinearParameters& p, Tensor& output,
                     WorkspaceArena& workspace, cudaStream_t stream,
                     InputBasis basis = InputBasis::Primal) {

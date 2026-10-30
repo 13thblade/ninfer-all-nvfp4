@@ -1522,9 +1522,10 @@ likely token was one of the labels, and `readout` whether the labels were read e
 from the top alternatives (`top_k`, where a label outside them counts as likely as the least likely
 alternative, its upper bound). `usage.input_tokens` sums the prompts of every read and
 `output_tokens` counts one token per question. The probabilities are those of a general chat model
-under this prompt, not calibrated to any data, and the head's logits are BF16, so two options the
-model scores within one BF16 step (about 0.1 nat at these magnitudes) share one probability; a label
-the tokenizer does not hold as one token is refused with 400.
+under this prompt, not calibrated to any data. The Qwen3.5 family reads them from FP32 logits; the
+other families' head logits are BF16, so two options such a model scores within one BF16 step (about
+0.1 nat at these magnitudes) share one probability. A label the tokenizer does not hold as one token
+is refused with 400.
 
 `POST /v1/decisions` takes OpenAI's request -- `input` as a string or user messages with string
 content or `input_text` parts, `questions` as an array of `{type, name, instructions}` with
@@ -1606,7 +1607,8 @@ under `--spec dflash2`, and 22.3 and 21.9 s with the checkpoint catalog (`--auto
 with one client.
 
 A branch attends to the state through the KV cache, so its answer carries the cache format's
-rounding, and the width of a pass changes how its kernels and the head's BF16 logits round. On that
+rounding, and the width of a pass changes how its kernels (and, outside the Qwen3.5 family, the
+head's BF16 logits) round. On that
 bench, against each question read as a request of its own, Bonsai's answers moved by at most 0.06
 in probability under `bf16` and `int8` with no pick changed, and by 0.27 under `rk2v4-e8`, 5 of 480
 picks; Gemma's picks changed 5 to 10 of 480 times under `bf16`, `fp8`, `int8`, `k8v4` and `rk8v4`,
