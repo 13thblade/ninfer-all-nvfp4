@@ -52,7 +52,7 @@
 | W4A16      | 4.222596 | 4.224089        | 4.222890        |
 | W4A8-int   | 4.220410 | 4.221694        | 4.223560        |
 
-本机只有一张卡，2/4 rank 是多 rank 共享同一设备跑出来的，只做功能与数值验证，不含性能测试。
+本机只有一张卡，2/4 rank 是多 rank 共享同一设备跑出来的，只做功能与数值验证，不含性能测试。PPL 的波动是多 rank 之间 FP32 累加改变了原计算路径导致的，并非劣化。
 
 ### 下一步
 
@@ -112,7 +112,7 @@ Corpus perplexity on the production profile (`--device-profile calibrate`): same
 | W4A16      | 4.222596     | 4.224089                     | 4.222890                     |
 | W4A8-int   | 4.220410     | 4.221694                     | 4.223560                     |
 
-This machine has one card, so the two- and four-rank rows put several ranks on one shared device: they verify function and numerics, not multi-GPU performance.
+This machine has one card, so the two- and four-rank rows put several ranks on one shared device: they verify function and numerics, not multi-GPU performance. The PPL movement is the multi-rank arithmetic path itself — a row-split rank writes an FP32 partial and the ranks add those before one rounding, where a single device accumulates in place — not a quality regression.
 
 ## Next steps
 
