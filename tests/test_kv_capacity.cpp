@@ -132,6 +132,33 @@ int main() {
                           "every device"),
                       "missing free memory for a device was accepted");
 
+    // What each device keeps beyond the reservation for the KV asked for. Automatic capacity at 4
+    // pages: device 0 needs 1000 + 2 * 100 + 50 of 2000, device 1 needs 500 + 2 * 300 + 50 of 1000.
+    const std::size_t tight[] = {1000};
+    const auto spare = ninfer::runtime::kv_capacity_spare(ninfer::KvCapacityPolicy::automatic(50),
+                                                          split, 4, 2000, tight);
+    failures += check(spare.size() == 2 && spare[0] == 750 && spare[1] == -150,
+                      "the spare of each device does not follow its curve and the headroom");
+    // An explicit capacity asks for its own pages (3 for 129 tokens) and keeps no headroom.
+    const auto explicit_spare = ninfer::runtime::kv_capacity_spare(
+        ninfer::KvCapacityPolicy::explicit_capacity(129), split, 4, 2000, tight);
+    failures += check(explicit_spare[0] == 2000 - 1100 && explicit_spare[1] == 1000 - 800,
+                      "an explicit capacity's spare used the automatic page count or headroom");
+    // The page count stays inside the curve, and resident graft pages come on top.
+    const auto held = ninfer::runtime::kv_capacity_spare(ninfer::KvCapacityPolicy::automatic(0),
+                                                         split, 100, 100000, tight);
+    failures += check(held[1] == 1000 - (500 + 18 * 300),
+                      "the spare was priced outside the curve's page range");
+    // No automatic pages price the smallest reservation, the one every start needs.
+    const auto least = ninfer::runtime::kv_capacity_spare(ninfer::KvCapacityPolicy::automatic(0),
+                                                          split, 0, 2000, tight);
+    failures += check(least[0] == 2000 - 1000 && least[1] == 1000 - 500,
+                      "the spare at no automatic pages was not the smallest reservation's");
+    const auto resident_spare = ninfer::runtime::kv_capacity_spare(
+        ninfer::KvCapacityPolicy::automatic(0), resident, 4, 2000);
+    failures += check(resident_spare.size() == 1 && resident_spare[0] == 2000 - (1000 + 2 * 128),
+                      "automatic spare did not add the resident graft pages");
+
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

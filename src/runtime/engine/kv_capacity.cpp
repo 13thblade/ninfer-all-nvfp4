@@ -224,4 +224,33 @@ KvCapacityResolution resolve_kv_capacity(const KvCapacityPolicy& policy,
     };
 }
 
+std::vector<std::int64_t>
+kv_capacity_spare(const KvCapacityPolicy& policy, const SequenceCapacityCurve& curve,
+                  std::uint32_t automatic_page_groups, std::size_t available_runtime_bytes,
+                  std::span<const std::size_t> extra_rank_available_bytes) {
+    validate_curve(curve);
+    if (extra_rank_available_bytes.size() != curve.extra_ranks.size()) {
+        throw std::invalid_argument("free memory was not given for every device in the plan");
+    }
+    const std::uint64_t asked =
+        policy.mode == KvCapacityMode::Automatic
+            ? static_cast<std::uint64_t>(automatic_page_groups) + curve.resident_main_pages
+            : explicit_page_groups(policy, curve);
+    const auto pages = static_cast<std::uint32_t>(
+        std::clamp<std::uint64_t>(asked, curve.minimum_main_page_groups,
+                                  curve.maximum_main_page_groups));
+    const std::size_t headroom =
+        policy.mode == KvCapacityMode::Automatic ? policy.automatic_headroom_bytes : 0;
+    const auto left = [&](std::size_t available, std::size_t reservation) {
+        return static_cast<std::int64_t>(available) - static_cast<std::int64_t>(reservation) -
+               static_cast<std::int64_t>(headroom);
+    };
+    std::vector<std::int64_t> out{left(available_runtime_bytes, curve.reservation_bytes(pages))};
+    for (std::size_t index = 0; index < curve.extra_ranks.size(); ++index) {
+        out.push_back(left(extra_rank_available_bytes[index],
+                           curve.extra_rank_reservation_bytes(index, pages)));
+    }
+    return out;
+}
+
 } // namespace ninfer::runtime
