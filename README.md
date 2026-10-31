@@ -18,7 +18,7 @@
 2. **整条通路的 kernel 性能优化工作。**
 3. **把 W4A16 和 W4A8-int 通路的开关接进 `ninfer-calibrate`，最优化性能校准可在目标设备上首次启动时实测得出。**
 4. **顺带优化了无原生 FP4 路径的 KV NVFP4 和 k8v4 的性能。**
-5. **W4A16 与 W4A8-int 两条链的融合内核都支持张量并行**（`--devices ... --tensor-parallel`），一层的权重可以按卡切开分给多个 rank 同时算。
+5. **W4A16 与 W4A8-int 两条链的融合内核都支持张量并行**（`--devices ... --tensor-parallel`）。
 
 本 fork 改动的上游文件不逐个在源码里标注，完整清单见 [MODIFICATIONS.md](MODIFICATIONS.md)；未改动的文件保持上游原样，归属见 [CONTRIBUTORS.md](CONTRIBUTORS.md) 与 git 历史。本 fork 的新增与改动部分 Copyright (c) 2026 13thblade，仍按同一 Apache-2.0 许可证发布。
 
@@ -52,13 +52,7 @@
 | W4A16      | 4.222596 | 4.224089        | 4.222890        |
 | W4A8-int   | 4.220410 | 4.221694        | 4.223560        |
 
-张量并行把同一层的权重按卡切开，每个 rank 只算自己那一份，再把各 rank 的 FP32 偏置和按 rank 序相加、只舍入一次。这与单卡的 FP32 链式求和是同一批项的不同结合顺序，因此**不会逐位一致**；要守的是 `core/tensor_parallel.h` 里那两条——各 rank 的副本逐字节相同、且只舍入一次。上表与单卡的差异最大 0.04%，属于这一类。
-
-本机只有一张卡，所以 2/4 rank 是让多个 rank **共享同一设备**跑的（`--devices 0,0` / `0,0,0,0`，传输走 Peer）：验证的是切分、规约与数值，跨卡的带宽差异测不出来。
-
-TP 下每个投影只有两种切法：**列切**（切输出行，各 rank 算自己那几行，拼起来即完整结果）和**行切**（切输入列，各 rank 只算 K 的一段，产出一份偏置和，由各 rank 相加）。行切的偏置和必须是 FP32，所以 int8 族也写 FP32：写出器按结果的 dtype 选，偏置和原样落在 FP32 平面上，各 rank 相加后只舍入一次。
-
-因此 TP 下 W4A8-int 覆盖全部 NVFP4 投影——attention/GDN 输入投影（列切，按 parts 提升）、FFN 的 gate/up（一个 rank 手上是两个父张量，各自算进 FP32 平面后 SwiGLU）、FFN 的 down 与 mixer 输出投影（行切，FP32 偏置和）。与单卡剩下的差别是**融合**而不是覆盖：rank 拿不到一个融合的 gate/up 父张量，down 也是先算偏置和再加残差，所以这些形状走的是两次 Linear（或一次投影）加一个逐元素 kernel。
+本机只有一张卡，2/4 rank 是多 rank 共享同一设备跑出来的，只做功能与数值验证，不含性能测试。
 
 ### 下一步
 
@@ -84,7 +78,7 @@ Five changes, in order:
 2. **Kernel work across the route.**
 3. **The W4A16 and W4A8-int route switches wired into `ninfer-calibrate`, so the optimal performance calibration is measured on first start on the target device.**
 4. **Alongside them, KV-cache performance for NVFP4 and k8v4 on cards without a native FP4 path was improved as well.**
-5. **The fused kernels of both the W4A16 and W4A8-int routes take tensor parallelism** (`--devices ... --tensor-parallel`): a layer's weights can be divided over the cards, one rank each.
+5. **The fused kernels of both the W4A16 and W4A8-int routes take tensor parallelism** (`--devices ... --tensor-parallel`).
 
 The upstream files this fork modifies are not marked one by one in the sources; the full list is in [MODIFICATIONS.md](MODIFICATIONS.md). Untouched files remain as upstream, credited in [CONTRIBUTORS.md](CONTRIBUTORS.md) and the git log. This fork's additions and modifications are Copyright (c) 2026 13thblade, offered under the same Apache-2.0 license.
 
@@ -118,29 +112,7 @@ Corpus perplexity on the production profile (`--device-profile calibrate`): same
 | W4A16      | 4.222596     | 4.224089                     | 4.222890                     |
 | W4A8-int   | 4.220410     | 4.221694                     | 4.223560                     |
 
-Tensor parallelism divides a layer's weights over the ranks, each computing its own share, and
-sums the ranks' FP32 partials in rank order with one rounding. That is a different association of
-the same terms than a single device's FP32 chain, so it is **not bit-identical** by construction;
-what holds is what `core/tensor_parallel.h` states -- every replica byte for byte identical, and one
-rounding where a single device rounds once. The table's largest difference from one GPU is 0.04%.
-
-This machine has one card, so the two- and four-rank runs put several ranks on **one shared device**
-(`--devices 0,0` / `0,0,0,0`, Peer transport): they exercise the division, the reductions and the
-numerics, not the bandwidth between cards.
-
-Under tensor parallelism a projection is split one of two ways. A column-parallel one divides
-output rows: each rank computes its own rows and the pieces concatenate. A row-parallel one divides
-input columns: each rank sums over its slice of K and the ranks add those partials. Such a partial
-must be FP32, so the int8 family writes FP32 too: its writer follows the result's dtype, and the
-partial lands unrounded in an FP32 plane, which the ranks add before the one rounding.
-
-The int8 route therefore covers every NVFP4 projection under tensor parallelism -- the attention and
-GDN input projections (column-split, promoted through the parts carrier a rank binds), the FFN's
-gate/up (two parents per rank, each into an FP32 plane before SwiGLU), and the FFN's down and the
-mixer output projection (row-split, FP32 partials). What a rank does not get is the *fused* form: it
-holds gate and up as two parents rather than one fused parent, and the down projection becomes a
-partial sum plus a residual add, so those shapes run two Linears (or one) and an elementwise kernel
-instead of a fused kernel.
+This machine has one card, so the two- and four-rank rows put several ranks on one shared device: they verify function and numerics, not multi-GPU performance.
 
 ## Next steps
 
