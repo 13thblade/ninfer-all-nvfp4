@@ -52,7 +52,7 @@
 | W4A16      | 4.222596 | 4.224089        | 4.222890        |
 | W4A8-int   | 4.220410 | 4.221694        | 4.223560        |
 
-本机只有一张卡，2/4 rank 是多 rank 共享同一设备跑出来的，只做功能与数值验证，不含性能测试。PPL 的波动是多 rank 之间 FP32 累加改变了原计算路径导致的，并非劣化。
+本机只有一张卡，2/4 rank 是多 rank 共享同一设备跑出来的，只做功能与数值验证，不含性能测试。PPL 的波动是多 rank 之间 FP32 累加改变了原计算路径导致的，并非劣化。内核的数值精度仍满足上游的对照测试要求：按其 Op 开发规范（`docs/maintainer/op-development.md`）对独立的 naive FP32/FP64 oracle 验收，融合 Op 用完整的融合公式作 oracle 而不是拼接生产 Op，也不以另一条 GPU 路径或成对实现一致作为判据。
 
 ### 下一步
 
@@ -112,7 +112,7 @@ Corpus perplexity on the production profile (`--device-profile calibrate`): same
 | W4A16      | 4.222596     | 4.224089                     | 4.222890                     |
 | W4A8-int   | 4.220410     | 4.221694                     | 4.223560                     |
 
-This machine has one card, so the two- and four-rank rows put several ranks on one shared device: they verify function and numerics, not multi-GPU performance. The PPL movement is the multi-rank arithmetic path itself — a row-split rank writes an FP32 partial and the ranks add those before one rounding, where a single device accumulates in place — not a quality regression.
+This machine has one card, so the two- and four-rank rows put several ranks on one shared device: they verify function and numerics, not multi-GPU performance. The PPL movement is the multi-rank arithmetic path itself — a row-split rank writes an FP32 partial and the ranks add those before one rounding, where a single device accumulates in place — not a quality regression. The kernels keep upstream's Op qualification ([`docs/maintainer/op-development.md`](docs/maintainer/op-development.md)): each fused route is checked against an independent naive FP32/FP64 oracle over the logical values its inputs represent, a fused oracle evaluating the complete fused formula rather than a composition of production Ops, and neither another GPU route nor pairwise implementation parity stands as that oracle.
 
 ## Next steps
 
