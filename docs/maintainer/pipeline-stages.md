@@ -316,8 +316,25 @@ families](#expert-parallelism-of-the-other-moe-families)).
   `models/qwen3_5/load.cpp`), and fills the cards in proportion to speed, capping a card at its room
   and passing the excess to the others (`fill_shares`). Automatic KV capacity also keeps its
   headroom free on every card, and when the longest context fits nowhere it divides the cards by
-  room instead of speed, so the KV it shrinks to is the most that fits. Decode reads every weight
-  once per token, so bandwidth sets each rank's time.
+  room instead of speed, so the KV it shrinks to is the most that fits. What the Engine reserves
+  beside the weights (workspace, round buffers, logits, CUDA Graphs, the exchange) is known only to
+  the loaded model's planner, so the first load does not count it. After that load each card's
+  spare is its free memory less the planner's reservation for the KV asked for (the explicit
+  capacity, or the longest context times the concurrency under automatic capacity, with its
+  headroom; `runtime::kv_capacity_spare`). When a card falls short, or the first split capped a
+  card that has room, the model is loaded again with `refit_tensor_split`'s shares: each card may
+  take its share plus its spare, in bytes of the divided work per share, the shares follow speed
+  within that room, and a card's room shrinks until the nearest split the weights allow fits it
+  (plan_load sizes each candidate's divided weights, KV and GDN state). When the cards together
+  lack room for that KV, automatic capacity shrinks it until the card short of the largest part of
+  its own KV fits, so the refit shares the shortfall out in proportion to each card's KV, searching
+  from the best split measured toward the even shortfall (a share moves whole units, and past a
+  head's end a whole head of every layer); it loads again only for at least a page more KV and only
+  when every card then holds the longest context. When the cards lack room even for the smallest
+  reservation, no split starts and the model is not loaded again. The startup log names the spares
+  and the splits, also when a card falls short and the split stays. A second refit corrects the
+  first; there is no third. Decode reads every weight once per token, so bandwidth sets each rank's
+  time.
 - **The pass** (`TextContext::run_tensor_parallel`). Rank 0 sends the residual and the control
   tensors to every rank over the stage links; each rank then keeps a replica of the residual. Each
   layer has two exchanges (`core/tensor_parallel.h`): after the mixer (attention: the ranks holding
