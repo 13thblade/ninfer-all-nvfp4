@@ -106,6 +106,10 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     if (options.max_context == 0) {
         throw std::invalid_argument("Engine max_context must be nonzero");
     }
+    if (options.prefill_stall_budget_ms != 0) {
+        throw std::invalid_argument("Qwen3.8-Flash-Next sizes its own prefill steps; --prefill-stall-budget-ms "
+                                    "applies to Qwen3.5-family models");
+    }
     if (options.enable_vision && options.vision_residency != VisionResidency::Resident) {
         throw std::invalid_argument(
             "Qwen3.8-Flash-Next runs its Vision tower resident on the device only");

@@ -782,9 +782,10 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
 }
 
 runtime::PrefillStepResult
-ProgramImpl::advance_prefill_raw(std::uint32_t lane, runtime::ExecutionTiming* failed_timing) {
+ProgramImpl::advance_prefill_raw(std::uint32_t lane, runtime::ExecutionTiming* failed_timing,
+                                 std::uint32_t max_tokens) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
-    return advance_prefill(active_sequence(lane), requests[lane], failed_timing);
+    return advance_prefill(active_sequence(lane), requests[lane], failed_timing, max_tokens);
 }
 
 runtime::ExecutionTiming ProgramImpl::resolve_prefill_raw(std::uint32_t lane, bool terminal,
@@ -1098,7 +1099,8 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
 
 runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                                                         RequestControl& request,
-                                                        runtime::ExecutionTiming* failed_timing) {
+                                                        runtime::ExecutionTiming* failed_timing,
+                                                        std::uint32_t max_tokens) {
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
     if (request.lifecycle != Lifecycle::Prefilling || !request.prefill) {
         throw std::logic_error("staged prefill step requires an active concurrent request");
@@ -1288,8 +1290,10 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
         }
 
         if (staged.cursor < staged.prompt_tokens) {
-            const std::uint32_t nominal =
-                std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
+            std::uint32_t nominal = std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
+            // A cap only shortens the step: the chunk's workspace and reservation stay planned.
+            // A media item's span decides its own step.
+            if (max_tokens != 0 && !staged.vision) { nominal = std::min(nominal, max_tokens); }
             mark_workspace_usage(staged.prepare_mtp ? workspace_plan.mtp_prefill
                                                     : workspace_plan.text_prefill);
             if (is_masked_draft_backend(speculative_backend)) {

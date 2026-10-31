@@ -18,10 +18,11 @@ namespace ninfer::ops::detail {
                                                               std::int32_t min_tokens,
                                                               std::int32_t max_tokens);
 
-// Whether a table names [N,K]. Every other shape, and every FP32 result, runs a runtime-shape route
-// over whole tiles of `kFp8ShareUnits`: A8 (fp8_general_a8.cu) for a shape no table names where the
-// policy allows it and fp8_general_uses_a8 holds, A16 (fp8_general.cu) otherwise. A registered
-// shape's FP32 result stays A16, so its table's workspace covers every call.
+// Whether a table names [N,K]. Every other shape, and an FP32 result where the selected table has
+// no FP32 form (all but the vocabulary head's unified table), runs a runtime-shape route over whole
+// tiles of `kFp8ShareUnits`: A8 (fp8_general_a8.cu) for a shape no table names where the policy
+// allows it and fp8_general_uses_a8 holds, A16 (fp8_general.cu) otherwise. A registered shape's
+// FP32 result stays A16, so its table's workspace covers every call.
 [[nodiscard]] bool fp8_registered(std::int32_t output_rows, std::int32_t input_rows);
 inline constexpr LinearShareUnits kFp8ShareUnits{64, 512};
 void fp8_general_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream);

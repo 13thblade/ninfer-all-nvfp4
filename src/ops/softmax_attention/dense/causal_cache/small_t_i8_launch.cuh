@@ -345,12 +345,23 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
 
 } // namespace small_t_i8
 
+// One kernel per unit that names the unit's module to cudaGetKernel: the call parses the module
+// without loading code into the context.
+template <typename Geometry, int TokenTile, typename CacheInput>
+__global__ void small_t_i8_module_anchor() {}
+
 template <typename Geometry, int TokenTile, typename CacheInput>
 void launch_small_t_i8(bool multi_batch, bool masked, const Tensor& q, CacheInput input, const Tensor& pos, float scale,
                        PagedKVBatchLayerView cache, const CausalSmallTInvocation& invocation,
                        std::int32_t logical_capacity, std::int32_t implementation_window,
                        std::int32_t splits, std::int32_t wave_splits, Tensor& partial_acc,
                        Tensor& partial_m, Tensor& partial_l, cudaStream_t stream) {
+    if (invocation.load_module_only) {
+        cudaKernel_t kernel = nullptr;
+        CUDA_CHECK(
+            cudaGetKernel(&kernel, small_t_i8_module_anchor<Geometry, TokenTile, CacheInput>));
+        return;
+    }
     const auto run = [&]<bool MultiBatch, bool Masked>() {
         small_t_i8::launch_tc_partial_i8<Geometry, TokenTile, MultiBatch, Masked>(
             q, input, pos, scale, cache, invocation, logical_capacity, implementation_window,

@@ -7,12 +7,14 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <filesystem>
 #include <iostream>
 #include <map>
 #include <memory>
 #include <set>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -260,6 +262,89 @@ int main(int argc, char** argv) {
                         "the device with twice the memory did not take more layers");
                 std::cout << "default stage layers: equal devices " << even[0] << '/' << even[1]
                           << ", 40/80 GiB " << skewed[0] << '/' << skewed[1] << '\n';
+            }
+            if (plan.config().text.gdn) {
+                // After a load, the automatic tensor split moves only what a rank lacked, or gives
+                // a rank the room the estimate did not.
+                LoadOptions tp     = options;
+                tp.ranks           = 2;
+                tp.tensor_parallel = true;
+                tp.tensor_split    = {1.0, 1.0};
+                const qwen::StageSizing sizing{.kv_storage = KvCacheStorage::BFloat16,
+                                               .state_slots = 1};
+                const std::vector<double> equal_speed{1.0, 1.0};
+                const auto rank_weights = [&](const std::vector<double>& split, std::size_t rank) {
+                    LoadOptions loaded  = tp;
+                    loaded.tensor_split = split;
+                    const auto at       = qwen::plan_load(reader, loaded, path);
+                    return at.materialization().device_capacity(rank);
+                };
+                const auto rank0_bytes = [&](const std::vector<double>& split) {
+                    return rank_weights(split, 0);
+                };
+                const std::array<std::int64_t, 2> room{1LL << 30, 1LL << 30};
+                require(!qwen::refit_tensor_split(reader, tp, sizing, room, equal_speed, path, {}),
+                        "a split that fits equal devices was refit");
+                const std::array<std::int64_t, 2> lacking{-(512LL << 20), 4LL << 30};
+                const auto smaller =
+                    qwen::refit_tensor_split(reader, tp, sizing, lacking, equal_speed, path, {});
+                require(smaller && (*smaller)[0] < 0.5, "rank 0 kept the share it lacked room for");
+                const std::uint64_t even0 = rank0_bytes(tp.tensor_split);
+                const std::uint64_t off   = even0 - rank0_bytes(*smaller);
+                // The GDN state of the heads that move is part of the 512 MiB.
+                require(off >= (480ULL << 20), "the refit left rank 0 short");
+                // Halfway back to the even split, rank 0 lacks room again: the refit moved no
+                // whole unit more than it had to.
+                const double back = ((*smaller)[0] + 0.5) / 2.0;
+                const std::uint64_t off_back = even0 - rank0_bytes({back, 1.0 - back});
+                require(off_back == off || off_back < (512ULL << 20),
+                        "the refit moved more than rank 0 lacked");
+                const std::vector<double> faster0{3.0, 1.0};
+                const auto larger =
+                    qwen::refit_tensor_split(reader, tp, sizing, room, faster0, path, {});
+                require(larger && (*larger)[0] > 0.5, "the faster rank was not given its room");
+                const std::uint64_t on = rank0_bytes(*larger) - rank0_bytes(tp.tensor_split);
+                require(on <= (1ULL << 30), "the faster rank was given more than its room");
+                // When the ranks together lack room for the KV asked for, automatic capacity
+                // shrinks it until the rank short of the largest part of its own KV fits, so the
+                // refit shares the shortfall out; an even shortfall stands.
+                qwen::StageSizing automatic = sizing;
+                automatic.kv_tokens         = 262144;
+                automatic.automatic_kv      = true;
+                const std::array<std::int64_t, 2> uneven{-(1536LL << 20), -(128LL << 20)};
+                const auto shared =
+                    qwen::refit_tensor_split(reader, tp, automatic, uneven, equal_speed, path, {});
+                require(shared && (*shared)[0] < 0.5, "rank 0 kept the share it was shortest of");
+                LoadOptions refit     = tp;
+                refit.tensor_split    = *shared;
+                const auto refit_plan = qwen::plan_load(reader, refit, path);
+                const auto& heads     = refit_plan.weights().text.tensor_shares;
+                require(heads[0].kv_head_end - heads[0].kv_head_begin ==
+                            heads[1].kv_head_end - heads[1].kv_head_begin,
+                        "the refit moved a KV head to share a shortfall smaller than its KV");
+                const double moved  = static_cast<double>(even0 - rank0_bytes(*shared));
+                const double short0 = static_cast<double>(1536LL << 20) - moved;
+                const double short1 = static_cast<double>(128LL << 20) +
+                                      static_cast<double>(rank_weights(*shared, 1)) -
+                                      static_cast<double>(rank_weights(tp.tensor_split, 1));
+                require(std::max(short0, short1) < static_cast<double>(1152LL << 20),
+                        "the refit did not share the shortfall out");
+                // No split that leaves a rank short of the longest context starts.
+                qwen::StageSizing whole_context = automatic;
+                whole_context.minimum_kv_tokens = automatic.kv_tokens;
+                require(!qwen::refit_tensor_split(reader, tp, whole_context, uneven, equal_speed,
+                                                  path, {}),
+                        "a split short of the smallest KV was refit");
+                const std::array<std::int64_t, 2> even{-(512LL << 20), -(512LL << 20)};
+                require(
+                    !qwen::refit_tensor_split(reader, tp, automatic, even, equal_speed, path, {}),
+                    "an even shortfall was refit");
+                std::cout << "tensor split refit: " << (off >> 20)
+                          << " MiB off rank 0 short of 512, " << (on >> 20)
+                          << " MiB onto rank 0 with 1024 to spare, ranks short of "
+                          << static_cast<long long>(short0) / (1LL << 20) << " and "
+                          << static_cast<long long>(short1) / (1LL << 20)
+                          << " MiB after 1536 and 128\n";
             }
             if (host_only) {
                 std::cout << path.filename().string() << ": Host binding passed, architecture="

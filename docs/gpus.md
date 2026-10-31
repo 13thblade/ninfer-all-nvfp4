@@ -77,7 +77,7 @@ means the card calibrates once at its first start.
 | ⬜ | RTX PRO 6000 Blackwell Max-Q | 96 GB | Workstation | ✓ | |
 | ⬜ | RTX PRO 5000 Blackwell | 72 / 48 GB | Workstation | 48 GB | |
 | ⬜ | RTX PRO 4500 Blackwell | 32 GB | Workstation | ✓ | |
-| ⬜ | RTX PRO 4000 Blackwell | 24 GB | Workstation | ✓ | |
+| ✅ | RTX PRO 4000 Blackwell | 24 GB | Workstation | ✓ | Qwen3.8-27B NVFP4 and a 27B with FP8 layers, on one card and with tensor parallelism over two |
 | ⬜ | RTX PRO 4000 Blackwell SFF | 24 GB | Workstation | | |
 | ⬜ | RTX PRO 2000 Blackwell | 16 GB | Workstation | | |
 | ⬜ | RTX PRO 6000 Blackwell Server Edition | 96 GB | Data center | ✓ | |
@@ -127,7 +127,7 @@ means the card calibrates once at its first start.
 | ⬜ | RTX A5500 | 24 GB | Workstation | | |
 | ⬜ | RTX A5000 | 24 GB | Workstation | ✓ | |
 | ⬜ | RTX A4500 | 20 GB | Workstation | | |
-| ⬜ | RTX A4000 | 16 GB | Workstation | | |
+| ✅ | RTX A4000 | 16 GB | Workstation | | Qwen3.8-27B NVFP4 and groupwise, with tensor parallelism over two and four cards |
 | ⬜ | RTX A2000 | 12 GB | Workstation | | |
 | ⬜ | RTX A1000 | 8 GB | Workstation | | |
 | ✅ | A40 | 48 GB | Data center | ✓ | Flint |

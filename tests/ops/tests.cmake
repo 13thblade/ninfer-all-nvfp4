@@ -322,6 +322,17 @@ foreach(mode IN ITEMS ngram-only onehot-distribution mtp-onehot mtp-distribution
   set_tests_properties(ninfer_speculative_${test_suffix}_test
     PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 240)
 endforeach()
+foreach(mode IN ITEMS default ngram-only mtp-onehot)
+  string(REPLACE "-" "_" test_suffix "${mode}")
+  set(mode_args "")
+  if(NOT mode STREQUAL "default")
+    set(mode_args "--${mode}")
+  endif()
+  add_test(NAME ninfer_speculative_fp32_logits_${test_suffix}_test
+    COMMAND ninfer_tests ninfer_speculative_round_test --fp32-logits ${mode_args})
+  set_tests_properties(ninfer_speculative_fp32_logits_${test_suffix}_test
+    PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 240)
+endforeach()
 set_tests_properties(ninfer_speculative_wide_accept_test PROPERTIES TIMEOUT 600)
 set_tests_properties(ninfer_speculative_wide_distribution_test PROPERTIES TIMEOUT 900 RUN_SERIAL TRUE)
 

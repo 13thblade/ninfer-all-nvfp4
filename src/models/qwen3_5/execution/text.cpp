@@ -105,6 +105,18 @@ Tensor matrix_window(Tensor& t, std::int32_t cols) {
     return t.slice(1, 0, cols);
 }
 
+// A BF16 proposal head writes into the first columns of a logits window; FP32 storage (the step
+// logits) holds them in its leading half.
+Tensor bf16_window(Tensor& t, std::int32_t cols) {
+    const Tensor window = matrix_window(t, cols);
+    return window.dtype == DType::BF16 ? window : Tensor(window.data, DType::BF16, {t.ne[0], cols});
+}
+
+void require_logits_window(const Tensor& t, std::int32_t rows, std::int32_t cols,
+                           const char* label) {
+    require_tensor_window(t, t.dtype == DType::FP32 ? DType::FP32 : DType::BF16, rows, cols, label);
+}
+
 class ScopedPositions {
 public:
     ScopedPositions(const Tensor*& slot, const Tensor& positions) : slot_(slot) {
@@ -491,8 +503,8 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         }
         require_tensor_shape(*final_hidden, DType::BF16, {dimension(config_.hidden_size), 1},
                              "MTP final prefill hidden");
-        require_tensor_shape(*logits, DType::BF16, {dimension(config_.vocab_size), 1},
-                             "MTP final prefill logits");
+        require_logits_window(*logits, dimension(config_.vocab_size), 1,
+                              "MTP final prefill logits");
         require_tensor_shape(*draft_token, DType::I32, {1}, "MTP final prefill draft token");
     }
 
@@ -602,7 +614,7 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
     require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), T},
                          "proposal hidden");
     require_tensor_shape(proposal_tokens, DType::I32, {T}, "proposal tokens");
-    require_tensor_window(logits, DType::BF16, dimension(config_.vocab_size), T, "proposal logits");
+    require_logits_window(logits, dimension(config_.vocab_size), T, "proposal logits");
     nvtx::ScopedRange proposal_range(nvtx::Name::MtpProposal, nvtx::Category::Mtp,
                                      static_cast<std::uint64_t>(T));
     if (proposal_head_ != nullptr) {
@@ -622,7 +634,7 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
     } else {
         Tensor output_logits = fp32_proposal_logits(mtp_->output_head)
                                    ? work_.alloc(DType::FP32, {dimension(config_.vocab_size), T})
-                                   : matrix_window(logits, T);
+                                   : bf16_window(logits, T);
         project(hidden, mtp_->output_head, output_logits, work_, ctx_.stream);
         ops::argmax(output_logits, proposal_tokens,
                     dimension(parameters_.model.resources().public_token_count), ctx_.stream);
@@ -650,8 +662,7 @@ void TextContext::mtp_forward_batch(const Tensor& ids, const Tensor& hidden,
         if (logits == nullptr || draft_token == nullptr) {
             throw std::invalid_argument("MTP logits and draft_token outputs are required");
         }
-        require_tensor_shape(*logits, DType::BF16, {dimension(config_.vocab_size), 1},
-                             "MTP logits");
+        require_logits_window(*logits, dimension(config_.vocab_size), 1, "MTP logits");
         require_tensor_shape(*draft_token, DType::I32, {1}, "MTP draft token");
     }
 
@@ -689,7 +700,7 @@ void TextContext::mtp_forward_ar_step(const Tensor& token, const Tensor& previou
                          "MTP AR previous hidden");
     require_tensor_shape(mtp_hidden, DType::BF16, {dimension(config_.hidden_size), 1},
                          "MTP AR output hidden");
-    require_tensor_shape(logits, DType::BF16, {dimension(config_.vocab_size), 1}, "MTP AR logits");
+    require_logits_window(logits, dimension(config_.vocab_size), 1, "MTP AR logits");
     require_tensor_shape(draft_token, DType::I32, {1}, "MTP AR draft token");
 
     auto position_scope  = work_.scope();
@@ -721,8 +732,8 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
                          "ordinary decode Linear Attention destination slots");
     require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), batch},
                          "ordinary decode hidden");
-    require_tensor_shape(logits, DType::BF16, {dimension(config_.vocab_size), batch},
-                         "ordinary decode logits");
+    require_tensor_shape(logits, target_logits_dtype(*lm_head_),
+                         {dimension(config_.vocab_size), batch}, "ordinary decode logits");
 
     cudaStream_t stream = ctx_.stream;
     work_.reset();
@@ -774,7 +785,8 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
                          "target verify batch Linear Attention slots");
     require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), width, batch},
                          "target verify batch hidden");
-    require_tensor_shape(logits, DType::BF16, {dimension(config_.vocab_size), width, batch},
+    require_tensor_shape(logits, target_logits_dtype(*lm_head_),
+                         {dimension(config_.vocab_size), width, batch},
                          "target verify batch logits");
     require_tensor_shape(target_tokens, DType::I32, {width, batch}, "target verify batch tokens");
 
@@ -2366,7 +2378,7 @@ PrefillChunkResult TextContext::prefill_final_batch(std::span<const PrefillSegme
         }
         const std::int32_t physical_rows = io_.logits.ne[0];
         const auto token_domain = dimension(parameters_.model.resources().public_token_count);
-        Tensor logits           = work_.alloc(DType::BF16, {physical_rows, outputs});
+        Tensor logits           = work_.alloc(io_.logits.dtype, {physical_rows, outputs});
         project(last, *lm_head_, logits, work_, s);
 
         // The logprob gather reads one contiguous sampling record per row.
@@ -2410,7 +2422,7 @@ PrefillChunkResult TextContext::prefill_final_batch(std::span<const PrefillSegme
         Tensor tokens = work_.alloc(DType::I32, {outputs});
         if (!sample_rows.empty()) {
             const auto sampled   = static_cast<std::int32_t>(sample_rows.size());
-            Tensor sample_logits = work_.alloc(DType::BF16, {physical_rows, sampled});
+            Tensor sample_logits = work_.alloc(io_.logits.dtype, {physical_rows, sampled});
             const DeviceSpan sample_configs_span =
                 work_.alloc_bytes(sizeof(ops::SamplingConfig) * static_cast<std::size_t>(sampled));
             auto* sample_configs = static_cast<ops::SamplingConfig*>(sample_configs_span.data);

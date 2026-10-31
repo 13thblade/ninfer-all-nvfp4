@@ -37,7 +37,8 @@ inline constexpr std::int32_t kLogprobTopK = 20;
  *   remaining slots hold id -1 and value -inf.
  *
  * Logical shapes:
- *   logits is BF16 [physical_rows,columns,batch] with kLogprobTopK<=token_domain<=physical_rows.
+ *   logits is BF16 or FP32 [physical_rows,columns,batch] with
+ *   kLogprobTopK<=token_domain<=physical_rows.
  *   configs points to `batch` contiguous device SamplingConfig records. drafts is I32
  *   [columns-1,batch] when columns>1 and is not read otherwise. top_ids is I32 and top_values FP32
  *   [kLogprobTopK,columns,batch]; lse is FP32 [columns,batch]; active is a device I32 [1].
@@ -49,7 +50,8 @@ inline constexpr std::int32_t kLogprobTopK = 20;
  *
  * Numeric:
  *   FP32 approximation of the ideal values; the reduction order and accumulator precision are the
- *   implementation's. The independent oracle evaluates the formula in FP64 from the BF16 inputs.
+ *   implementation's. The independent oracle evaluates the formula in FP64 from the BF16 or FP32
+ *   inputs.
  *
  * Effects:
  *   Writes top_ids, top_values and lse when *active is nonzero, and nothing at all when it is

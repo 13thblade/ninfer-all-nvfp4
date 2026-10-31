@@ -58,19 +58,23 @@ bool prefix_item_count(const std::vector<VisionItem>& items, std::size_t tokens,
 using DigestPair = std::array<std::uint64_t, 2>;
 
 constexpr DigestPair kDigestOffset{1469598103934665603ULL, 7809847782465536322ULL};
-constexpr DigestPair kDigestPrime{1099511628211ULL, 14029467366897019727ULL};
-constexpr std::uint64_t kTokenDigestDomain   = 0x6e696e6665722d74ULL;
+constexpr DigestPair kDigestMultiplier{0x9e3779b97f4a7c15ULL, 0xd6e8feb86659fd93ULL};
 constexpr std::uint64_t kRewriteDigestDomain = 0x6e696e6665722d72ULL;
 constexpr std::uint64_t kVisionDigestDomain  = 0x6e696e6665722d76ULL;
+// Tags the first word of a token record. That word has its top 16 bits clear and the domain words
+// above do not, so the word sequence of a prompt is a unique encoding of its records.
+constexpr std::uint64_t kTokenDigestTag = 0x74ULL << 40U;
 
+// Mixes one 64-bit word into each lane: an xor, an odd multiply and an xorshift, each a bijection
+// of the lane, so two prompts that differ in one word always differ afterwards. Word-wise mixing
+// costs a few cycles per word where a byte-wise FNV-1a step cost eight dependent multiplies, which
+// on a 156K-token prompt was 10 ms of every admission (RTX 5060 Ti host, 2026-10-28).
 void mix_digest(DigestPair& digest, std::uint64_t value) noexcept {
     for (std::size_t lane = 0; lane < digest.size(); ++lane) {
         const std::uint64_t lane_value =
             lane == 0 ? value : std::rotl(value ^ 0x9e3779b97f4a7c15ULL, 29);
-        for (std::uint32_t byte = 0; byte < 8; ++byte) {
-            digest[lane] ^= static_cast<std::uint8_t>(lane_value >> (8U * byte));
-            digest[lane] *= kDigestPrime[lane];
-        }
+        std::uint64_t mixed = (digest[lane] ^ lane_value) * kDigestMultiplier[lane];
+        digest[lane]        = mixed ^ (mixed >> 32U);
     }
 }
 
@@ -98,12 +102,11 @@ void append_digest(std::vector<DigestPair>& digests, TokenId token, std::uint8_t
                    const std::array<std::int32_t, 3>& positions,
                    std::span<const std::uint32_t> rewrite_frontiers, std::size_t& next_rewrite) {
     DigestPair digest = digests.back();
-    mix_digest(digest, kTokenDigestDomain);
-    mix_digest(digest, static_cast<std::uint32_t>(token));
-    mix_digest(digest, token_type);
-    for (const std::int32_t position : positions) {
-        mix_digest(digest, static_cast<std::uint32_t>(position));
-    }
+    mix_digest(digest, kTokenDigestTag | (static_cast<std::uint64_t>(token_type) << 32U) |
+                           static_cast<std::uint32_t>(token));
+    mix_digest(digest, (static_cast<std::uint64_t>(static_cast<std::uint32_t>(positions[1])) << 32U) |
+                           static_cast<std::uint32_t>(positions[0]));
+    mix_digest(digest, static_cast<std::uint32_t>(positions[2]));
     const std::size_t frontier = digests.size();
     while (next_rewrite < rewrite_frontiers.size() && rewrite_frontiers[next_rewrite] == frontier) {
         mix_digest(digest, kRewriteDigestDomain);

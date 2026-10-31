@@ -10,6 +10,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 using namespace ninfer;
@@ -104,7 +105,29 @@ std::vector<std::uint16_t> make_extreme_logits(std::int32_t physical_rows, std::
     return logits;
 }
 
-std::vector<double> target_logprobs_oracle(const std::vector<std::uint16_t>& logits,
+// FP32 logits at 1/16384 steps, finer than BF16 holds at these magnitudes.
+std::vector<float> make_fine_logits(std::int32_t physical_rows, std::int32_t valid_rows,
+                                    std::int32_t columns) {
+    std::vector<float> logits(static_cast<std::size_t>(physical_rows) * columns, 96.0f);
+    for (std::int32_t column = 0; column < columns; ++column) {
+        const std::size_t base = static_cast<std::size_t>(column) * physical_rows;
+        for (std::int32_t row = 0; row < valid_rows; ++row) {
+            const std::uint32_t mixed = static_cast<std::uint32_t>(row) * 1664525u +
+                                        static_cast<std::uint32_t>(column + 1) * 1013904223u;
+            logits[base + static_cast<std::size_t>(row)] =
+                -24.0f + static_cast<float>(mixed % 786432u) * (1.0f / 16384.0f);
+        }
+    }
+    return logits;
+}
+
+// The value a stored logit represents: BF16 bits or an FP32 value.
+double represented(std::uint16_t bits) { return static_cast<double>(bf16_to_f32(bits)); }
+
+double represented(float value) { return static_cast<double>(value); }
+
+template <typename Logit>
+std::vector<double> target_logprobs_oracle(const std::vector<Logit>& logits,
                                            const std::vector<std::int32_t>& targets,
                                            std::int32_t physical_rows, std::int32_t valid_rows) {
     std::vector<double> expected(targets.size());
@@ -112,13 +135,13 @@ std::vector<double> target_logprobs_oracle(const std::vector<std::uint16_t>& log
         const std::size_t base = column * static_cast<std::size_t>(physical_rows);
         double maximum         = -std::numeric_limits<double>::infinity();
         for (std::int32_t row = 0; row < valid_rows; ++row) {
-            maximum = std::max(maximum, static_cast<double>(bf16_to_f32(logits[base + row])));
+            maximum = std::max(maximum, represented(logits[base + row]));
         }
         double sum = 0.0;
         for (std::int32_t row = 0; row < valid_rows; ++row) {
-            sum += std::exp(static_cast<double>(bf16_to_f32(logits[base + row])) - maximum);
+            sum += std::exp(represented(logits[base + row]) - maximum);
         }
-        const double target = static_cast<double>(bf16_to_f32(logits[base + targets[column]]));
+        const double target = represented(logits[base + targets[column]]);
         expected[column]    = target - maximum - std::log(sum);
     }
     return expected;
@@ -129,19 +152,21 @@ std::vector<double> fp32_as_double(const void* device, std::size_t count) {
     return {values.begin(), values.end()};
 }
 
+template <typename Logit>
 int run_case(const std::string& label, std::int32_t physical_rows, std::int32_t valid_rows,
-             std::int32_t columns, const std::vector<std::uint16_t>& logits) {
+             std::int32_t columns, const std::vector<Logit>& logits) {
     const auto targets  = make_targets(valid_rows, columns);
     const auto expected = target_logprobs_oracle(logits, targets, physical_rows, valid_rows);
+    const DType dtype   = std::is_same_v<Logit, float> ? DType::FP32 : DType::BF16;
 
-    GuardedDeviceBuffer device_logits(logits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_logits(logits.size() * sizeof(Logit));
     GuardedDeviceBuffer device_targets(targets.size() * sizeof(std::int32_t));
     GuardedDeviceBuffer device_output(targets.size() * sizeof(float));
     device_logits.copy_from_host(logits.data(), device_logits.bytes());
     device_targets.copy_from_host(targets.data(), device_targets.bytes());
     device_output.fill(0xcd);
 
-    Tensor logits_tensor(device_logits.data(), DType::BF16, {physical_rows, columns});
+    Tensor logits_tensor(device_logits.data(), dtype, {physical_rows, columns});
     Tensor targets_tensor(device_targets.data(), DType::I32, {columns});
     Tensor output_tensor(device_output.data(), DType::FP32, {columns});
     ops::target_logprobs(logits_tensor, targets_tensor, valid_rows, output_tensor, nullptr);
@@ -149,9 +174,8 @@ int run_case(const std::string& label, std::int32_t physical_rows, std::int32_t 
 
     int failures = verify_reduction(label, fp32_as_double(device_output.data(), targets.size()),
                                     expected, kTargetLogprobsFp32Criterion);
-    failures +=
-        verify_exact((label + " preserves logits").c_str(),
-                     from_device<std::uint16_t>(device_logits.data(), logits.size()), logits);
+    failures += verify_exact((label + " preserves logits").c_str(),
+                             from_device<Logit>(device_logits.data(), logits.size()), logits);
     failures +=
         verify_exact((label + " preserves targets").c_str(),
                      from_device<std::int32_t>(device_targets.data(), targets.size()), targets);
@@ -238,6 +262,10 @@ int main() {
                          make_shift_logits(257, 257, 31, 0.0f));
     failures += run_case("target_logprobs shifted logits", 257, 257, 31,
                          make_shift_logits(257, 257, 31, 32.0f));
+    failures += run_case("target_logprobs FP32 full vocabulary C=3", 248320, 248077, 3,
+                         make_fine_logits(248320, 248077, 3));
+    failures += run_case("target_logprobs FP32 non-aligned rows C=1025", 523, 509, 1025,
+                         make_fine_logits(523, 509, 1025));
     failures += run_validation_cases();
 
     std::cout << (failures ? "FAIL" : "OK") << " target_logprobs\n";

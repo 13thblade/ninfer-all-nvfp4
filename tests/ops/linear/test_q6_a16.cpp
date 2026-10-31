@@ -8,6 +8,7 @@
 
 namespace {
 using namespace ninfer::test::linear;
+using ninfer::DType;
 
 constexpr Invocation a16(std::int32_t t) { return {t}; }
 
@@ -27,8 +28,12 @@ int q6_a16_conformance() {
         a16(97),   a16(104), a16(111), a16(112), a16(113),  a16(128),  a16(129),   a16(512),
         a16(1024), graph(2), graph(3), graph(9), graph(17), graph(48), graph(112),
     };
-    failures += run_shape("Q6_A16", ActivationCompute::A16, make_q6_g64_fp16_weight,
-                          {248320, 5120, 191U, Comparison::SampledRows, false, kN248320K5120});
+    // The vocabulary head in BF16 and as the FP32 logits the sampler reads.
+    for (const DType out : {DType::BF16, DType::FP32}) {
+        failures += run_shape("Q6_A16", ActivationCompute::A16, make_q6_g64_fp16_weight,
+                              {248320, 5120, 191U, Comparison::SampledRows, false, kN248320K5120,
+                               ActivationSigns::Centered, out});
+    }
 
     constexpr std::array kN34816K5120{
         a16(1),  a16(4),  a16(5),   a16(6),   a16(7),   a16(8),    a16(9),
@@ -68,14 +73,15 @@ int q6_a16_conformance() {
 
 // The vocabulary head's profile-routed schedules, forced over their whole width domains so the
 // GEMV (T=1..2) and the small-T MMA's one-, two- and four-tile variants (T=1..32) are qualified
-// whatever the installed profile routes.
-int q6_head_routed_schedules() {
+// whatever the installed profile routes, in BF16 and FP32.
+int q6_head_routed_schedules(DType out) {
     int failures = 0;
     {
         const ninfer::ops::DeviceRouteForce force("q6_head/248320x5120", "gemv");
         constexpr std::array kGemv{a16(1), a16(2), graph(1), graph(2)};
         failures += run_shape("Q6_A16 head gemv", ActivationCompute::A16, make_q6_g64_fp16_weight,
-                              {248320, 5120, 211U, Comparison::SampledRows, false, kGemv});
+                              {248320, 5120, 211U, Comparison::SampledRows, false, kGemv,
+                               ActivationSigns::Centered, out});
     }
     {
         const ninfer::ops::DeviceRouteForce force("q6_head/248320x5120", "small_t");
@@ -84,7 +90,8 @@ int q6_head_routed_schedules() {
                                      a16(32), graph(4), graph(8), graph(16), graph(32)};
         failures +=
             run_shape("Q6_A16 head small-T", ActivationCompute::A16, make_q6_g64_fp16_weight,
-                      {248320, 5120, 223U, Comparison::SampledRows, false, kSmallT});
+                      {248320, 5120, 223U, Comparison::SampledRows, false, kSmallT,
+                       ActivationSigns::Centered, out});
     }
     return failures;
 }
@@ -110,9 +117,12 @@ int main() {
             failures += table_failures;
         }
         ninfer::ops::detail::force_linear_route_table(std::nullopt);
-        const int head_failures = q6_head_routed_schedules();
-        std::cout << (head_failures == 0 ? "OK" : "FAIL") << " Q6_A16 head routed schedules\n";
-        failures += head_failures;
+        for (const DType out : {DType::BF16, DType::FP32}) {
+            const int head_failures = q6_head_routed_schedules(out);
+            std::cout << (head_failures == 0 ? "OK" : "FAIL") << " Q6_A16 head routed schedules ("
+                      << (out == DType::BF16 ? "BF16" : "FP32") << ")\n";
+            failures += head_failures;
+        }
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
         std::cerr << "Q6_A16 Linear: " << error.what() << '\n';

@@ -54,6 +54,7 @@ struct ServeOptions {
     std::uint32_t pending_timeout_ms   = 600000;
     std::uint32_t prefill_chunk        = 0; // 0: the Engine's automatic chunk
     std::uint32_t decode_rounds_per_prefill = 0;
+    std::uint32_t prefill_stall_budget_ms   = 0;
     bool fast_prefill_kernel           = false;
     std::filesystem::path context_cost_presets;
     std::string device_profile = "auto";

@@ -57,6 +57,8 @@ int main() {
     sample.stats.host_state_occupied_slots     = 6;
     sample.stats.waiting_expired_requests      = 2;
     sample.stats.cancelled_prefills_salvaged   = 1;
+    sample.stats.paced_prefill_steps           = 3;
+    sample.stats.paced_prefill_deferred_tokens = 4608;
 
     ServeMetrics metrics;
     GenerationOutcome outcome;
@@ -123,6 +125,9 @@ int main() {
                           at("ninfer:waiting_cancelled_requests_total") == 0.0 &&
                           at("ninfer:cancelled_prefills_salvaged_total") == 1.0,
                       "abandoned and cancelled requests are counted");
+    failures += check(at("ninfer:paced_prefill_steps_total") == 3.0 &&
+                          at("ninfer:paced_prefill_deferred_tokens_total") == 4608.0,
+                      "paced prefill steps and their deferred tokens are exported");
 
     const auto empty = samples(ServeMetrics{}.render(LoadCapacity{}, LoadSample{}));
     failures += check(empty.at("llamacpp:predicted_tokens_seconds") == 0.0 &&

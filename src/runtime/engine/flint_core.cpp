@@ -84,6 +84,10 @@ ConstructedFlint construct_flint(const EngineOptions& options, DeviceContext& de
     if (options.max_context == 0) {
         throw std::invalid_argument("Engine max_context must be nonzero");
     }
+    if (options.prefill_stall_budget_ms != 0) {
+        throw std::invalid_argument("Flint sizes its own prefill steps; --prefill-stall-budget-ms "
+                                    "applies to Qwen3.5-family models");
+    }
     if (options.enable_vision) { throw std::invalid_argument("Flint has no vision tower"); }
     // Flint publishes no draft head: a speculative round verifies what a context lookup proposes.
     const SpeculativeOptions& speculative = options.speculative;

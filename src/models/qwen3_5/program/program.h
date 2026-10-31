@@ -1103,8 +1103,11 @@ public:
     // worker resumes the transaction as soon as it can progress. Returns false, without
     // waiting, when no transfer is in flight. A failed transfer surfaces at the next progress.
     [[nodiscard]] bool wait_context_transfer() noexcept;
+    // Runs one prefill step. `max_tokens` (0: none) cuts a text step below the planned chunk, as a
+    // capture frontier cuts it; a step through a media item runs as planned.
     [[nodiscard]] PrefillProgress
-    advance_prefill(SequenceHandle sequence, runtime::ExecutionTiming* failed_timing = nullptr);
+    advance_prefill(SequenceHandle sequence, runtime::ExecutionTiming* failed_timing = nullptr,
+                    std::uint32_t max_tokens = 0);
     // The columns and segments a sequence's next prefill step adds to a pass shared with other
     // sequences' last chunks; empty when its step must run alone (a media prompt, a capture or tap
     // inside the rest of the prompt, drafter work, more than one chunk left, ...). A branched read

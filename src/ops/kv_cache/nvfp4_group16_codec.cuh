@@ -86,31 +86,56 @@ __device__ __forceinline__ __half2 kv_cache_e2m1x2_to_half2(unsigned codes) {
     return *reinterpret_cast<const __half2*>(&bits);
 }
 
+// The E2M1 pair and E4M3 scale conversions of the dequantizers below. Blackwell converts both in
+// one instruction each and keeps the vendor forms; older targets take the integer expansions, which
+// return the same values (see kv_cache_nvfp4_dequant_f16x8).
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+__device__ __forceinline__ __half2 kv_cache_nvfp4_pair_to_half2(std::uint8_t byte) {
+    __nv_fp4x2_e2m1 encoded;
+    encoded.__x = byte;
+    return static_cast<__half2>(encoded);
+}
+
+__device__ __forceinline__ float kv_cache_nvfp4_scale_to_float(std::uint8_t scale_code) {
+    __nv_fp8_e4m3 encoded;
+    encoded.__x = scale_code;
+    return static_cast<float>(encoded);
+}
+#else
+__device__ __forceinline__ __half2 kv_cache_nvfp4_pair_to_half2(std::uint8_t byte) {
+    return kv_cache_e2m1x2_to_half2(byte);
+}
+
+__device__ __forceinline__ float kv_cache_nvfp4_scale_to_float(std::uint8_t scale_code) {
+    return detail::kNvfp4E4M3ScaleA16[scale_code] * 2.0F;
+}
+#endif
+
 __device__ __forceinline__ int4 kv_cache_nvfp4_dequant_f16x8(const std::uint8_t* codes,
                                                              std::uint8_t scale_code) {
     // Every finite E2M1 value times a legal nonnegative E4M3 cache scale is exactly representable
     // in FP16 (at most four product fraction bits and magnitude <= 2688). Half2 multiplication is
     // therefore the exact FP16 expansion boundary, not an additional approximation.
     //
-    // Neither operand goes through the vendor conversions. On sm_86/sm_89 ptxas outlines
-    // __nv_fp4x2_e2m1 and __nv_fp8_e4m3 into calls carrying BSSY/BSYNC and a divide fixup, and
-    // this path is issue-bound on them: the nvfp4 prompt-attention kernel held 88 CALL.REL where
-    // its bf16 counterpart holds 3. kv_cache_e2m1x2_to_half2 above is the expansion the sm70 path
-    // already runs; the scale comes from the ue4m3 table the weight codec reads, whose entries are
-    // exactly half the vendor value, so doubling it is exact.
+    // Before Blackwell neither operand goes through the vendor conversions. On sm_86/sm_89 ptxas
+    // outlines __nv_fp4x2_e2m1 and __nv_fp8_e4m3 into calls carrying BSSY/BSYNC and a divide
+    // fixup, and this path is issue-bound on them: the nvfp4 prompt-attention kernel held 88
+    // CALL.REL where its bf16 counterpart holds 3. kv_cache_e2m1x2_to_half2 above is the expansion
+    // the sm70 path already runs; the scale comes from the ue4m3 table the weight codec reads,
+    // whose entries are exactly half the vendor value, so doubling it is exact.
     //
     // Bit-exactness: an E2M1 magnitude is an FP16 with a zero low byte, so the permuted pattern is
     // the same value the vendor conversion returns, and both scale routes land on the same
     // representable half. The one input the two disagree on is a 0x7F scale byte, which the
     // quantizer cannot emit (it converts a value clamped into [2^-9, 448] with __NV_SATFINITE).
-    const float scale_f  = detail::kNvfp4E4M3ScaleA16[scale_code] * 2.0F;
+    const float scale_f  = kv_cache_nvfp4_scale_to_float(scale_code);
     const __half2 scale2 = __float2half2_rn(scale_f);
     const std::uint32_t packed = load_vec<std::uint32_t>(codes);
     const std::uint8_t* bytes  = reinterpret_cast<const std::uint8_t*>(&packed);
     unsigned half_bits[4];
 #pragma unroll
     for (int pair = 0; pair < 4; ++pair) {
-        const __half2 value = __hmul2(kv_cache_e2m1x2_to_half2(bytes[pair]), scale2);
+        const __half2 value = __hmul2(kv_cache_nvfp4_pair_to_half2(bytes[pair]), scale2);
         half_bits[pair]     = *reinterpret_cast<const unsigned*>(&value);
     }
     return make_int4(static_cast<int>(half_bits[0]), static_cast<int>(half_bits[1]),
@@ -125,13 +150,13 @@ __device__ __forceinline__ int4 kv_cache_nvfp4_dequant_bf16x8(const std::uint8_t
     // Same two substitutions as the FP16 form above, and the same reasoning: the E2M1 half2 the
     // sm70 path builds carries the exact value, so widening it to FP32 and multiplying by the
     // table-derived scale reproduces the vendor expression bit for bit.
-    const float scale_f        = detail::kNvfp4E4M3ScaleA16[scale_code] * 2.0F;
+    const float scale_f        = kv_cache_nvfp4_scale_to_float(scale_code);
     const std::uint32_t packed = load_vec<std::uint32_t>(codes);
     const std::uint8_t* bytes  = reinterpret_cast<const std::uint8_t*>(&packed);
     unsigned bf16_bits[4];
 #pragma unroll
     for (int pair = 0; pair < 4; ++pair) {
-        const float2 decoded = __half22float2(kv_cache_e2m1x2_to_half2(bytes[pair]));
+        const float2 decoded = __half22float2(kv_cache_nvfp4_pair_to_half2(bytes[pair]));
         const __nv_bfloat162 value =
             __floats2bfloat162_rn(decoded.x * scale_f, decoded.y * scale_f);
         bf16_bits[pair] = *reinterpret_cast<const unsigned*>(&value);
@@ -147,14 +172,14 @@ struct KVCacheNvfp4DequantizedF16x16 {
 
 __device__ __forceinline__ KVCacheNvfp4DequantizedF16x16
 kv_cache_nvfp4_dequant_f16x16(const std::uint8_t* codes, std::uint8_t scale_code) {
-    const float scale_f  = detail::kNvfp4E4M3ScaleA16[scale_code] * 2.0F;
+    const float scale_f  = kv_cache_nvfp4_scale_to_float(scale_code);
     const __half2 scale2 = __float2half2_rn(scale_f);
     const int2 packed         = load_vec<int2>(codes);
     const std::uint8_t* bytes = reinterpret_cast<const std::uint8_t*>(&packed);
     unsigned half_bits[8];
 #pragma unroll
     for (int pair = 0; pair < 8; ++pair) {
-        const __half2 value = __hmul2(kv_cache_e2m1x2_to_half2(bytes[pair]), scale2);
+        const __half2 value = __hmul2(kv_cache_nvfp4_pair_to_half2(bytes[pair]), scale2);
         half_bits[pair]     = *reinterpret_cast<const unsigned*>(&value);
     }
     return {

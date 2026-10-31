@@ -110,13 +110,20 @@ consume_tile(const __nv_bfloat16* __restrict__ x, int k, const uint4* s_code, co
     }
 }
 
-template <int kTokens>
+__device__ __forceinline__ void store_output(__nv_bfloat16* out, float value) {
+    *out = __float2bfloat16_rn(value);
+}
+
+__device__ __forceinline__ void store_output(float* out, float value) { *out = value; }
+
+// Out is BF16, or FP32 for the vocabulary head's unrounded logits.
+template <int kTokens, typename Out>
 __global__ void __launch_bounds__(kRowsPerBlock * 32)
     q6_rowsplit_gemv_kernel(const __nv_bfloat16* __restrict__ x,
                             const std::uint8_t* __restrict__ codes,
                             const std::uint8_t* __restrict__ high_bits,
-                            const std::uint8_t* __restrict__ scales,
-                            __nv_bfloat16* __restrict__ out, int n, int k, int padded_k) {
+                            const std::uint8_t* __restrict__ scales, Out* __restrict__ out, int n,
+                            int k, int padded_k) {
     __shared__ uint4 s_code[kRowsPerBlock][kStages][32];
     __shared__ uint4 s_high[kRowsPerBlock][kStages][16];
     __shared__ uint4 s_scale[kRowsPerBlock][kStages][2];
@@ -170,9 +177,7 @@ __global__ void __launch_bounds__(kRowsPerBlock * 32)
 #pragma unroll
     for (int token = 0; token < kTokens; ++token) {
         const float value = warp_reduce_sum(acc[token]);
-        if (lane == 0) {
-            out[static_cast<std::int64_t>(token) * n + row] = __float2bfloat16_rn(value);
-        }
+        if (lane == 0) { store_output(out + static_cast<std::int64_t>(token) * n + row, value); }
     }
 }
 
@@ -185,10 +190,17 @@ void launch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) 
         throw std::invalid_argument("q6 gemv: unsupported token count or K");
     }
     const unsigned grid = static_cast<unsigned>((n + kRowsPerBlock - 1) / kRowsPerBlock);
-    q6_rowsplit_gemv_kernel<kTokens><<<grid, kRowsPerBlock * 32, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
-        static_cast<const std::uint8_t*>(w.qhigh), static_cast<const std::uint8_t*>(w.scales),
-        static_cast<__nv_bfloat16*>(out.data), n, k, static_cast<int>(w.padded_shape[1]));
+    const auto run      = [&]<typename Out>() {
+        q6_rowsplit_gemv_kernel<kTokens, Out><<<grid, kRowsPerBlock * 32, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+            static_cast<const std::uint8_t*>(w.qhigh), static_cast<const std::uint8_t*>(w.scales),
+            static_cast<Out*>(out.data), n, k, static_cast<int>(w.padded_shape[1]));
+    };
+    if (out.dtype == DType::FP32) {
+        run.template operator()<float>();
+    } else {
+        run.template operator()<__nv_bfloat16>();
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

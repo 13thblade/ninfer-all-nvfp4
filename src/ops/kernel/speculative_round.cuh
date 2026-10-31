@@ -14,6 +14,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 namespace ninfer::ops {
 
@@ -133,9 +134,9 @@ speculative_store_accept_result(const std::int32_t* row_drafts, std::int32_t k, 
 // `column_token(i)` returns the token this round would license at column i, so the caller decides
 // where that comes from -- target ids for the target-token routes, workspace.dist_idx for the
 // sampling-workspace ones.
-template <typename ColumnToken>
+template <typename Logit, typename ColumnToken>
 __device__ __forceinline__ bool
-speculative_commit_span_is_finite(const __nv_bfloat16* row_logits, std::int32_t accepted_count,
+speculative_commit_span_is_finite(const Logit* row_logits, std::int32_t accepted_count,
                                   std::int32_t physical_rows, ColumnToken column_token) {
     for (int column = 0; column <= accepted_count; ++column) {
         if (!sampling_selected_logit_is_finite(
@@ -204,10 +205,12 @@ __device__ __forceinline__ void speculative_sparse_warp_store(const int* drafts,
 // `logits` is the same verify-logit block the dense greedy path checks, laid out
 // [row][column][physical_rows]; `physical_rows` is its innermost stride. It is read only to test
 // the committed span for finiteness, so the greedy routes all refuse a NaN column alike.
-__device__ __forceinline__ void speculative_sparse_warp_greedy(
-    const int* target_tokens, const __nv_bfloat16* logits, const int* drafts, int* lengths,
-    int* anchors, int* licensed_tokens, int* licensed_counts, int* accepted, int row, int extent,
-    int k, int physical_rows) {
+template <typename Logit>
+__device__ __forceinline__ void
+speculative_sparse_warp_greedy(const int* target_tokens, const Logit* logits, const int* drafts,
+                               int* lengths, int* anchors, int* licensed_tokens,
+                               int* licensed_counts, int* accepted, int row, int extent, int k,
+                               int physical_rows) {
     const int lane = threadIdx.x & 31;
     // A copy round verifies up to 63 drafts, so the columns take one ballot per 32. The first
     // rejection wins, and `a` stays warp-uniform.
@@ -223,8 +226,7 @@ __device__ __forceinline__ void speculative_sparse_warp_greedy(
     // `a` and `terminal` are warp-uniform -- `a` comes from ballots, `terminal` from a uniform
     // load -- so every lane computes the same answer here. That is deliberate: the alternative is
     // computing it on one lane and shuffling, which costs more than the redundant load.
-    const __nv_bfloat16* row_logits =
-        logits + static_cast<std::int64_t>(row) * (k + 1) * physical_rows;
+    const Logit* row_logits = logits + static_cast<std::int64_t>(row) * (k + 1) * physical_rows;
     // One lane per column of the committed span, so the span costs one ballot per 32 columns
     // rather than the sequential loop the single-threaded routes need.
     bool span_is_finite = true;
@@ -240,21 +242,24 @@ __device__ __forceinline__ void speculative_sparse_warp_greedy(
                                   licensed_counts, accepted, span_is_finite);
 }
 
+template <typename Logit>
 __global__ __launch_bounds__(256) void speculative_accept_sparse_warp_greedy_kernel(
-    const int* target_tokens, const __nv_bfloat16* logits, const int* drafts,
-    const int* current_extents, int* lengths, int* anchors, int* licensed_tokens,
-    int* licensed_counts, int* accepted, int k, int physical_rows) {
+    const int* target_tokens, const Logit* logits, const int* drafts, const int* current_extents,
+    int* lengths, int* anchors, int* licensed_tokens, int* licensed_counts, int* accepted, int k,
+    int physical_rows) {
     const int row    = threadIdx.x / 32;
     const int extent = min(k, max(0, current_extents[row]));
     speculative_sparse_warp_greedy(target_tokens, logits, drafts, lengths, anchors, licensed_tokens,
                                    licensed_counts, accepted, row, extent, k, physical_rows);
 }
 
-__device__ __forceinline__ void speculative_sparse_warp_accept(
-    SamplingWorkspace workspace, const __nv_bfloat16* logits, const int* drafts,
-    const int* candidate_ids, const float* proposal_q, const SamplingConfig& cfg, int k, int row,
-    int extent, bool greedy, int* lengths, int* anchors, int* licensed_tokens, int* licensed_counts,
-    int* accepted, int physical_rows) {
+template <typename Logit>
+__device__ __forceinline__ void
+speculative_sparse_warp_accept(SamplingWorkspace workspace, const Logit* logits, const int* drafts,
+                               const int* candidate_ids, const float* proposal_q,
+                               const SamplingConfig& cfg, int k, int row, int extent, bool greedy,
+                               int* lengths, int* anchors, int* licensed_tokens,
+                               int* licensed_counts, int* accepted, int physical_rows) {
     const int lane       = threadIdx.x & 31;
     const int old_length = lengths[row];
     int a                = extent;
@@ -302,8 +307,7 @@ __device__ __forceinline__ void speculative_sparse_warp_accept(
     bool terminal_is_finite;
     if (greedy) {
         terminal = workspace.dist_idx[sampling_dist_offset(a, 0)];
-        const __nv_bfloat16* row_logits =
-            logits + static_cast<std::int64_t>(row) * (k + 1) * physical_rows;
+        const Logit* row_logits = logits + static_cast<std::int64_t>(row) * (k + 1) * physical_rows;
         // The whole committed span, one lane per column and one ballot per 32 columns, for the
         // reason given at speculative_commit_span_is_finite: a matched column whose logits are all
         // NaN matched by accident. The tokens come from dist_idx here rather than from target ids,
@@ -383,8 +387,9 @@ __device__ __forceinline__ std::int64_t speculative_row_column(const std::int32_
 // p_i(draft). Launch with a single block of kSamplerBlock threads; only thread 0
 // performs the sequential accept/commit while the whole block cooperates on the
 // per-column truncated-distribution build.
+template <typename Logit>
 __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_coupled_drafts_kernel(
-    const std::int32_t* target_tokens, const __nv_bfloat16* logits, const std::int32_t* drafts,
+    const std::int32_t* target_tokens, const Logit* logits, const std::int32_t* drafts,
     const std::int32_t* current_extents, std::int32_t* lengths, std::int32_t* anchors,
     std::int32_t* licensed_tokens, std::int32_t* licensed_counts, std::int32_t* accepted,
     const SamplingConfig* configs, std::int32_t token_domain, std::int32_t physical_rows,
@@ -399,7 +404,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_coupled_draf
     const std::int32_t* row_targets = target_tokens + first_column;
     const std::int32_t* row_drafts  = drafts + row * k;
     std::int32_t* row_tokens        = licensed_tokens + row * cols;
-    const __nv_bfloat16* row_logits = logits + first_column * physical_rows;
+    const Logit* row_logits         = logits + first_column * physical_rows;
     const bool penalties =
         cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f || cfg.token_mask != nullptr;
 
@@ -458,8 +463,8 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_coupled_draf
             float best_value        = -CUDART_INF_F;
             int best_index          = INT_MAX;
             for (int v = tid; v < token_domain; v += blockDim.x) {
-                const float value = sampling_adjusted_logit(__bfloat162float(row_logits[base + v]),
-                                                            v, cfg, row_drafts, i);
+                const float value = sampling_adjusted_logit(sampling_logit(row_logits[base + v]), v,
+                                                            cfg, row_drafts, i);
                 if (sampling_better(value, v, best_value, best_index)) {
                     best_value = value;
                     best_index = v;
@@ -544,8 +549,9 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_coupled_draf
     }
 }
 
+template <typename Logit>
 __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_topk_kernel(
-    const __nv_bfloat16* logits, const std::int32_t* drafts, const std::int32_t* current_extents,
+    const Logit* logits, const std::int32_t* drafts, const std::int32_t* current_extents,
     const SamplingConfig* configs, std::int32_t token_domain, std::int32_t physical_rows,
     std::int32_t cols, std::int32_t k, SamplingWorkspace workspace,
     std::size_t workspace_row_stride, const std::int32_t* column_starts) {
@@ -575,18 +581,23 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
         (speculative_row_column(column_starts, row, cols) + col) * physical_rows;
     const std::int32_t* row_drafts = drafts + row * k;
     const int tile_start           = partial * kSamplerPartialTileItems;
-    if (!penalties) {
-        unsigned int keys[kSamplerItemsPerThread];
+    // BF16 logits order as 16 bits beside a tile index, which halves the keys the tile sort moves;
+    // FP32 logits take the 64-bit keys of the penalty route below.
+    if constexpr (std::is_same_v<Logit, __nv_bfloat16>) {
+        if (!penalties) {
+            unsigned int keys[kSamplerItemsPerThread];
 #pragma unroll
-        for (int item = 0; item < kSamplerItemsPerThread; ++item) {
-            const int tile_index = item * blockDim.x + threadIdx.x;
-            const int v          = tile_start + tile_index;
-            keys[item] =
-                v < token_domain ? sampling_bf16_tile_sort_key(logits[base + v], tile_index) : 0u;
+            for (int item = 0; item < kSamplerItemsPerThread; ++item) {
+                const int tile_index = item * blockDim.x + threadIdx.x;
+                const int v          = tile_start + tile_index;
+                keys[item] = v < token_domain
+                                 ? sampling_bf16_tile_sort_key(logits[base + v], tile_index)
+                                 : 0u;
+            }
+            sampling_store_bf16_tile_topk(keys, cap, tile_start, workspace, col, partial,
+                                          topk_storage.bf16);
+            return;
         }
-        sampling_store_bf16_tile_topk(keys, cap, tile_start, workspace, col, partial,
-                                      topk_storage.bf16);
-        return;
     }
 
     unsigned long long keys[kSamplerItemsPerThread];
@@ -597,9 +608,9 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
     for (int item = 0; item < kSamplerItemsPerThread; ++item) {
         const int v = tile_start + item * blockDim.x + threadIdx.x;
         if (v < token_domain) {
-            const __nv_bfloat16 raw = logits[base + v];
-            keys[item]              = sampling_sort_key(
-                sampling_adjusted_logit(__bfloat162float(raw), v, cfg, row_drafts, col), v);
+            keys[item] = sampling_sort_key(
+                sampling_adjusted_logit(sampling_logit(logits[base + v]), v, cfg, row_drafts, col),
+                v);
         } else {
             keys[item] = 0ull;
         }
@@ -620,9 +631,9 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
     sampling_store_tile_topk(keys, cap, workspace, col, partial, topk_storage.fp32);
 }
 
-template <bool SparseProposal>
+template <typename Logit, bool SparseProposal>
 __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group_finalize_kernel(
-    const std::int32_t* target_tokens, const __nv_bfloat16* logits, const std::int32_t* drafts,
+    const std::int32_t* target_tokens, const Logit* logits, const std::int32_t* drafts,
     const std::int32_t* candidate_ids, const float* proposal_q, const std::int32_t* current_extents,
     std::int32_t* lengths, std::int32_t* anchors, std::int32_t* licensed_tokens,
     std::int32_t* licensed_counts, std::int32_t* accepted, const SamplingConfig* configs,
@@ -665,8 +676,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
                 // Spelled `true` rather than `!SparseProposal` because the double negative
                 // reads as if it could disable the counts here, which it cannot.
                 static_assert(!SparseProposal, "dense finalize path only");
-                const __nv_bfloat16* row_logits =
-                    logits + first_column * physical_rows;
+                const Logit* row_logits = logits + first_column * physical_rows;
                 speculative_store_accept_result<true>(
                     row_drafts, k, row, a, t_star, lengths, anchors, row_tokens, licensed_counts,
                     accepted, &cfg,
@@ -813,8 +823,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
                     // Spelled `true` rather than `!SparseProposal` because the double negative
                     // reads as if it could disable the counts here, which it cannot.
                     static_assert(!SparseProposal, "dense finalize path only");
-                    const __nv_bfloat16* row_logits =
-                        logits + first_column * physical_rows;
+                    const Logit* row_logits = logits + first_column * physical_rows;
                     speculative_store_accept_result<true>(
                         row_drafts, k, row, a, tstar, lengths, anchors, row_tokens, licensed_counts,
                         accepted, &cfg,

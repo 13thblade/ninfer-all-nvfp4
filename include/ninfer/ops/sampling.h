@@ -56,7 +56,7 @@ struct SamplingConfig {
                                                             std::int32_t max_lanes);
 
 /**
- * Produces one token id per independent request row. `logits` is contiguous BF16
+ * Produces one token id per independent request row. `logits` is contiguous BF16 or FP32
  * [physical_rows,B], `out` and `logical_positions` are contiguous I32 [B], and only vocabulary
  * rows v in [0,token_domain) participate. `configs` is a device-resident contiguous
  * SamplingConfig[B] array. Greedy and stochastic rows may coexist in one invocation.

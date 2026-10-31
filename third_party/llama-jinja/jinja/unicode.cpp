@@ -45,6 +45,22 @@ std::vector<Character> characters(std::string_view text) {
     return result;
 }
 
+Character character_at(std::string_view text, std::size_t begin) {
+    const auto cp = utf8::utf8_codepoint_at(text, begin, "Jinja string");
+    return {cp.value, begin, begin + cp.length};
+}
+
+Character character_before(std::string_view text, std::size_t end) {
+    if (end == 0 || end > text.size()) throw std::out_of_range("Jinja string offset");
+    // A UTF-8 sequence is at most four bytes: its lead byte is the last non-continuation byte.
+    std::size_t begin = end - 1;
+    while (begin > 0 && end - begin < 4 && (static_cast<unsigned char>(text[begin]) & 0xc0) == 0x80)
+        --begin;
+    const auto ch = character_at(text.substr(0, end), begin);
+    if (ch.end != end) throw std::invalid_argument("invalid UTF-8 in Jinja string");
+    return ch;
+}
+
 std::size_t length(std::string_view text) {
     std::size_t result = 0;
     for (std::size_t pos = 0; pos < text.size(); ++result) {

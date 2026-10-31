@@ -7,6 +7,9 @@ ninfer_add_test(ninfer_host_memory_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../te
 ninfer_add_test(ninfer_context_cost_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_context_cost.cpp"
   LIBRARIES ninfer_runtime_support ninfer::json)
 
+ninfer_add_test(ninfer_prefill_pacing_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_prefill_pacing.cpp"
+  LIBRARIES ninfer_runtime_support)
+
 ninfer_add_test(ninfer_checkpoint_recovery_impact_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../host/test_checkpoint_recovery_impact.cpp")
 

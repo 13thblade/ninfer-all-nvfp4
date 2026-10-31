@@ -74,7 +74,8 @@ struct ShapeCase {
     bool verify_input_preservation;
     std::span<const Invocation> invocations;
     ActivationSigns activation_signs = ActivationSigns::Centered;
-    // BF16, or FP32: a tensor-parallel rank's partial sum, which the ranks add before rounding.
+    // BF16, or FP32: a tensor-parallel rank's partial sum, which the ranks add before rounding, or
+    // the vocabulary head's logits.
     DType out = DType::BF16;
     // The row-split weight permuted into the panel layout (artifact/permute_row_split.h), as the
     // loader leaves a Volta rank's projections; the case is skipped on other devices.

@@ -8,6 +8,7 @@
 #include "runtime/engine/context_cache/context_cost.h"
 #include "runtime/engine/device_profile.h"
 #include "runtime/engine/diagnostics.h"
+#include "runtime/engine/prefill_pacing.h"
 #include "artifact/reader.h"
 #include "artifact/formats.h"
 #include "core/paged_kv_cache.h"
@@ -22,6 +23,7 @@
 #include "runtime/contract/rope_scaling.h"
 
 #include <algorithm>
+#include <numeric>
 #include <cmath>
 #include <filesystem>
 #include <memory>
@@ -104,6 +106,9 @@ void validate_options(const EngineOptions& options) {
     }
     if (options.decode_rounds_per_prefill > kMaximumDecodeRoundsPerPrefill) {
         throw std::invalid_argument("Engine decode_rounds_per_prefill must be in [0,4096]");
+    }
+    if (options.prefill_stall_budget_ms > runtime::kMaximumPrefillStallBudgetMs) {
+        throw std::invalid_argument("Engine prefill_stall_budget_ms must be in [0,60000]");
     }
     if (options.enable_vision && options.media_live_bytes == 0) {
         throw std::invalid_argument(
@@ -657,18 +662,28 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
                             reader.directory().component("text").proposal.has_value();
         options.speculative.proposal_head = stored ? ProposalHead::Optimized : ProposalHead::Full;
     }
-    if (options.tensor_parallel && options.tensor_split.empty()) {
+    // Without --tensor-split the first load takes default_tensor_split's shares. Only the loaded
+    // model's planner knows what the Engine reserves on each device; a device left short of it
+    // (or with room the estimate did not give it) loads the model again with the shares
+    // refit_tensor_split moves, so a device gives up only what it lacks. A second refit corrects
+    // what the first one sized from the artifact alone; there is no third.
+    const bool automatic_split = options.tensor_parallel && options.tensor_split.empty();
+    std::vector<double> split_speed;
+    models::qwen3_5::StageSizing split_sizing;
+    if (automatic_split) {
         const std::vector<std::size_t> free_now = free_bytes_by_rank(device);
         const std::vector<std::uint64_t> free_bytes(free_now.begin(), free_now.end());
-        const models::qwen3_5::StageSizing sizing{
+        split_sizing = models::qwen3_5::StageSizing{
             .kv_storage = options.kv_cache,
             .state_slots =
                 options.max_concurrency + options.context_cache.device_state_slots.value_or(0U),
             .kv_tokens         = std::uint64_t(options.max_context) * options.max_concurrency,
+            .minimum_kv_tokens = options.max_context,
             .automatic_kv      = options.kv_capacity.mode == KvCapacityMode::Automatic,
             .kv_headroom_bytes = options.kv_capacity.automatic_headroom_bytes};
+        split_speed          = rank_copy_bandwidth(device);
         options.tensor_split = models::qwen3_5::default_tensor_split(
-            reader, models::load_options(options), sizing, free_bytes, rank_copy_bandwidth(device));
+            reader, models::load_options(options), split_sizing, free_bytes, split_speed);
     }
     if (options.devices.size() > 1 && options.stage_layers.empty() && !options.tensor_parallel) {
         const std::vector<std::size_t> free_now = free_bytes_by_rank(device);
@@ -683,63 +698,132 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
             reader, models::load_options(options), sizing, free_bytes);
     }
     core::set_wddm_evictable_budget(options.wddm_evictable_budget);
-    StartupPhaseScope binding(options.startup_observer, StartupPhase::TargetPlan);
-    auto plan =
-        models::qwen3_5::plan_load(reader, models::load_options(options), options.artifact_path,
-                                   models::qwen3_5::rank_tiers(device));
-    binding.complete();
-    auto model = models::qwen3_5::materialize_model(
-        std::move(plan), device, &options.startup_observer,
-        artifact::MaterializeOptions{
-            .suspendable     = options.suspend.enabled,
-            .retained_reader = options.suspend.enabled ? retained_reader : nullptr});
-    device.synchronize();
-    // An automatic Host budget is sized now that the weights are in place, from what the host
-    // still has; the media caches grow after startup, so they are reserved too.
-    if (options.context_cache.host_cache_auto) {
-        const std::uint64_t media_bytes =
-            options.enable_vision
-                ? std::uint64_t(options.media_cache_bytes) + options.media_live_bytes
-                : 0U;
-        options.context_cache = resolve_auto_host_cache_now(options.context_cache, media_bytes);
-        // The checkpoint catalog sizes its Host pools from a nonzero budget; a host with no memory
-        // to spare has none.
-        if (options.context_cache.mode == ContextCacheMode::Legacy &&
-            options.context_cache.host_cache_budget_bytes == 0U) {
-            options.context_cache.host_cache_budget_bytes.reset();
-            options.context_cache.host_state_slots       = 0;
-            options.context_cache.host_kv_capacity_bytes = 0;
+    const ContextCacheOptions requested_cache = options.context_cache;
+    std::unique_ptr<ModelInstance> instance;
+    std::optional<models::qwen3_5::SequencePlanner> planner;
+    std::optional<StartupPhaseScope> planning;
+    std::vector<std::size_t> free_by_rank;
+    std::size_t overlay_window_bytes = 0;
+    for (int refits = 0;; ++refits) {
+        StartupPhaseScope binding(options.startup_observer, StartupPhase::TargetPlan);
+        auto plan = models::qwen3_5::plan_load(reader, models::load_options(options),
+                                               options.artifact_path,
+                                               models::qwen3_5::rank_tiers(device));
+        binding.complete();
+        auto model = models::qwen3_5::materialize_model(
+            std::move(plan), device, &options.startup_observer,
+            artifact::MaterializeOptions{
+                .suspendable     = options.suspend.enabled,
+                .retained_reader = options.suspend.enabled ? retained_reader : nullptr});
+        device.synchronize();
+        // An automatic Host budget is sized now that the weights are in place, from what the host
+        // still has; the media caches grow after startup, so they are reserved too.
+        options.context_cache = requested_cache;
+        if (options.context_cache.host_cache_auto) {
+            const std::uint64_t media_bytes =
+                options.enable_vision
+                    ? std::uint64_t(options.media_cache_bytes) + options.media_live_bytes
+                    : 0U;
+            options.context_cache = resolve_auto_host_cache_now(options.context_cache, media_bytes);
+            // The checkpoint catalog sizes its Host pools from a nonzero budget; a host with no
+            // memory to spare has none.
+            if (options.context_cache.mode == ContextCacheMode::Legacy &&
+                options.context_cache.host_cache_budget_bytes == 0U) {
+                options.context_cache.host_cache_budget_bytes.reset();
+                options.context_cache.host_state_slots       = 0;
+                options.context_cache.host_kv_capacity_bytes = 0;
+            }
         }
+        StartupPhaseScope frontend(options.startup_observer, StartupPhase::FrontendInitialize);
+        instance = std::make_unique<ModelInstance>(std::move(model), options);
+        frontend.complete();
+        planning.emplace(options.startup_observer, StartupPhase::TargetFinalize);
+        overlay_window_bytes =
+            models::qwen3_5::prepare_vision_overlay(instance->parameters, device, options);
+        // Each injected graft keeps its text KV pages for good; the pool grows by that many so a
+        // request can still use all the capacity that was asked for.
+        std::uint32_t graft_main_pages = 0;
+        for (const auto& graft : instance->frontend.grafts()) {
+            if (graft.kind != models::qwen3_5::GraftKind::PrefillKV) {
+                const auto page_tokens = static_cast<std::uint32_t>(kPagedKVPageSize);
+                graft_main_pages += (graft.n_slots + page_tokens - 1U) / page_tokens;
+            }
+        }
+        planner.emplace(models::qwen3_5::make_sequence_planner(
+            instance->parameters, device,
+            artifact_scoped_disk_tier(options, instance->model->info().artifact_id),
+            graft_main_pages));
+        free_by_rank = free_bytes_by_rank(device, options.wddm_evictable_budget,
+                                          instance->model->storage_stats().device_capacity_bytes);
+        if (!automatic_split || refits == 2) { break; }
+        const auto& curve = planner->capacity_curve();
+        const std::uint32_t context_pages =
+            (options.max_context + curve.main_page_tokens - 1U) / curve.main_page_tokens;
+        const auto extra_free = std::span<const std::size_t>(free_by_rank).subspan(1);
+        // Each spare carries its unit, so a list of them does not read as one number.
+        const auto mib = [](std::span<const std::int64_t> bytes) {
+            std::string out;
+            for (std::size_t rank = 0; rank < bytes.size(); ++rank) {
+                out += (rank == 0 ? "" : ", ") + std::to_string(bytes[rank] / (1LL << 20)) + " MiB";
+            }
+            return out;
+        };
+        const auto shares = [](std::span<const double> split) {
+            std::string out;
+            for (std::size_t rank = 0; rank < split.size(); ++rank) {
+                char text[32];
+                std::snprintf(text, sizeof(text), "%.3f", split[rank]);
+                out += (rank == 0 ? "" : ",") + std::string(text);
+            }
+            return out;
+        };
+        // Shares move work between the devices, not off them: when together they lack even the
+        // smallest reservation, no split starts, and the planner says so below.
+        const std::vector<std::int64_t> least =
+            kv_capacity_spare(options.kv_capacity, curve, 0, free_by_rank.front(), extra_free);
+        if (std::accumulate(least.begin(), least.end(), std::int64_t{0}) < 0) {
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                               "tensor split: the devices keep %s beyond the smallest reservation "
+                               "at shares %s; no split holds it",
+                               mib(least).c_str(), shares(options.tensor_split).c_str());
+            break;
+        }
+        const std::vector<std::int64_t> spare =
+            kv_capacity_spare(options.kv_capacity, curve, context_pages * options.max_concurrency,
+                              free_by_rank.front(), extra_free);
+        auto refit = models::qwen3_5::refit_tensor_split(
+            reader, models::load_options(options), split_sizing, spare, split_speed,
+            options.artifact_path, models::qwen3_5::rank_tiers(device));
+        if (!refit) {
+            if (std::ranges::any_of(spare, [](std::int64_t bytes) { return bytes < 0; })) {
+                publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                                   "tensor split: the devices keep %s beyond the reservation at "
+                                   "shares %s; no other split the weights allow does better",
+                                   mib(spare).c_str(), shares(options.tensor_split).c_str());
+            }
+            break;
+        }
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "tensor split: the devices keep %s beyond the reservation at shares "
+                           "%s; loading again with %s",
+                           mib(spare).c_str(), shares(options.tensor_split).c_str(),
+                           shares(*refit).c_str());
+        // Free this load's device memory before the next one.
+        planner.reset();
+        planning->complete();
+        planning.reset();
+        instance.reset();
+        device.synchronize();
+        options.tensor_split = std::move(*refit);
     }
-    StartupPhaseScope frontend(options.startup_observer, StartupPhase::FrontendInitialize);
-    auto instance = std::make_unique<ModelInstance>(std::move(model), options);
-    frontend.complete();
-    StartupPhaseScope planning(options.startup_observer, StartupPhase::TargetFinalize);
-    const std::size_t overlay_window_bytes =
-        models::qwen3_5::prepare_vision_overlay(instance->parameters, device, options);
     const auto signature = models::qwen3_5::prefill_signature(*instance->model);
     auto context_cost    = resolve_context_machine_cost(
         {.hardware_class =
                 context_cost_hardware_class(device.props.name, device.props.major, device.props.minor),
             .prefill_signature = signature},
         options.context_cost.preset_path);
-    // Each injected graft keeps its text KV pages for good; the pool grows by that many so a
-    // request can still use all the capacity that was asked for.
-    std::uint32_t graft_main_pages = 0;
-    for (const auto& graft : instance->frontend.grafts()) {
-        if (graft.kind != models::qwen3_5::GraftKind::PrefillKV) {
-            const auto page_tokens = static_cast<std::uint32_t>(kPagedKVPageSize);
-            graft_main_pages += (graft.n_slots + page_tokens - 1U) / page_tokens;
-        }
-    }
-    auto planner = models::qwen3_5::make_sequence_planner(
-        instance->parameters, device,
-        artifact_scoped_disk_tier(options, instance->model->info().artifact_id), graft_main_pages);
-    std::vector<std::size_t> free_by_rank =
-        free_bytes_by_rank(device, options.wddm_evictable_budget,
-                           instance->model->storage_stats().device_capacity_bytes);
     auto resolution = resolve_kv_capacity(
-        options.kv_capacity, planner.capacity_curve(), free_by_rank.front(),
+        options.kv_capacity, planner->capacity_curve(), free_by_rank.front(),
         std::span<const std::size_t>(free_by_rank).subspan(1));
     std::unique_ptr<models::qwen3_5::execution::NativeExpertRuntime> experts;
     if (!instance->model->expert_sources().layers.empty()) {
@@ -752,7 +836,7 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
         const bool automatic_kv = options.kv_capacity.mode == KvCapacityMode::Automatic;
         const std::uint64_t headroom =
             automatic_kv ? options.kv_capacity.automatic_headroom_bytes : 0;
-        const auto& curve = planner.capacity_curve();
+        const auto& curve = planner->capacity_curve();
         reserved[0] = models::qwen3_5::native_expert_runtime_reservation(
             automatic_kv, options.expert_cache_bytes, reserved[0],
             curve.minimum_device_reservation_bytes) + headroom;
@@ -785,10 +869,10 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
         free_by_rank = free_bytes_by_rank(device, options.wddm_evictable_budget,
                                           instance->model->storage_stats().device_capacity_bytes);
         resolution = resolve_kv_capacity(
-            options.kv_capacity, planner.capacity_curve(), free_by_rank.front(),
+            options.kv_capacity, planner->capacity_curve(), free_by_rank.front(),
             std::span<const std::size_t>(free_by_rank).subspan(1));
     }
-    auto sequence   = std::move(planner).finalize(resolution.main_page_groups);
+    auto sequence   = std::move(*planner).finalize(resolution.main_page_groups);
     if (sequence.device_reservation_bytes() != resolution.runtime_reservation_bytes ||
         sequence.kv_capacity() != resolution.resolved_tokens ||
         !std::ranges::equal(sequence.extra_rank_reservation_bytes(),
@@ -805,7 +889,7 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
     instance->frontend.publish_long_anchor_limit(
         resolved.context_cache.max_long_anchors_per_continuation.value_or(0));
     instance->kv_capacity_resolution = resolution;
-    planning.complete();
+    planning->complete();
     StartupPhaseScope program(options.startup_observer, StartupPhase::ProgramInitialize);
     instance->program = models::qwen3_5::create_program(instance->parameters, std::move(sequence),
                                                         device, options.startup_observer,

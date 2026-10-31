@@ -1,5 +1,6 @@
 ninfer_add_test(ninfer_ngram_proposer_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_proposer.cpp")
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_proposer.cpp"
+  LIBRARIES ninfer_core)
 
 ninfer_add_test(ninfer_ngram_archive_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_archive.cpp"

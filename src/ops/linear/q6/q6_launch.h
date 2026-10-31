@@ -16,7 +16,7 @@ void launch_q6_a16_simt_r8_t6_cg(const Tensor& x, const Weight& weight, Tensor& 
 void launch_q6_a16_simt_r8_t7_cg(const Tensor& x, const Weight& weight, Tensor& out,
                                  cudaStream_t stream);
 // One warp per row of the 248320x5120 head, one or two tokens per weight read
-// (q6_a16_rowsplit_gemv.cu).
+// (q6_a16_rowsplit_gemv.cu). BF16 or FP32 out, as the small-T routes below.
 void launch_q6_a16_rowsplit_gemv_t1(const Tensor& x, const Weight& weight, Tensor& out,
                                     cudaStream_t stream);
 void launch_q6_a16_rowsplit_gemv_t2(const Tensor& x, const Weight& weight, Tensor& out,

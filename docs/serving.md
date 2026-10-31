@@ -811,6 +811,8 @@ they advance during a long request rather than at its completion, and their rati
 | `ninfer:cancelled_prefills_total` | counter | requests cancelled while their prompt prefilled |
 | `ninfer:cancelled_prefill_computed_tokens_total` | counter | prompt tokens those requests had computed |
 | `ninfer:cancelled_prefills_salvaged_total` | counter | cancelled prefills the context cache kept, at the point they reached or at their deepest anchor, so the retry resumes there |
+| `ninfer:paced_prefill_steps_total` | counter | prefill steps `--prefill-stall-budget-ms` cut short while another stream generated |
+| `ninfer:paced_prefill_deferred_tokens_total` | counter | prompt tokens those steps left to later steps |
 | `ninfer:context_selections_total{source}` | counter | admissions by the context-cache source they started from: `root` (a miss, prefilled from token zero), `private_endpoint`, `private_turn_closure`, `private_response_replay`, `private_long_anchor`, `shared_stable_prefix`; the hit rate is 1 - root / all |
 | `ninfer:context_pressure_events_total{event}` | counter | what pressure planning did to inactive owners: `private_owner_evicted`, `private_owner_degraded`, `shared_owner_evicted`, `shared_owner_degraded`, `checkpoint_dropped` |
 | `ninfer:context_pressure_searches_total{result}` | counter | pressure planning searches: `started`, `budget_exhausted`, `maximal_fallback` |
@@ -1522,9 +1524,10 @@ likely token was one of the labels, and `readout` whether the labels were read e
 from the top alternatives (`top_k`, where a label outside them counts as likely as the least likely
 alternative, its upper bound). `usage.input_tokens` sums the prompts of every read and
 `output_tokens` counts one token per question. The probabilities are those of a general chat model
-under this prompt, not calibrated to any data, and the head's logits are BF16, so two options the
-model scores within one BF16 step (about 0.1 nat at these magnitudes) share one probability; a label
-the tokenizer does not hold as one token is refused with 400.
+under this prompt, not calibrated to any data. The Qwen3.5 family reads them from FP32 logits; the
+other families' head logits are BF16, so two options such a model scores within one BF16 step (about
+0.1 nat at these magnitudes) share one probability. A label the tokenizer does not hold as one token
+is refused with 400.
 
 `POST /v1/decisions` takes OpenAI's request -- `input` as a string or user messages with string
 content or `input_text` parts, `questions` as an array of `{type, name, instructions}` with
@@ -1606,7 +1609,8 @@ under `--spec dflash2`, and 22.3 and 21.9 s with the checkpoint catalog (`--auto
 with one client.
 
 A branch attends to the state through the KV cache, so its answer carries the cache format's
-rounding, and the width of a pass changes how its kernels and the head's BF16 logits round. On that
+rounding, and the width of a pass changes how its kernels (and, outside the Qwen3.5 family, the
+head's BF16 logits) round. On that
 bench, against each question read as a request of its own, Bonsai's answers moved by at most 0.06
 in probability under `bf16` and `int8` with no pick changed, and by 0.27 under `rk2v4-e8`, 5 of 480
 picks; Gemma's picks changed 5 to 10 of 480 times under `bf16`, `fp8`, `int8`, `k8v4` and `rk8v4`,
@@ -2176,6 +2180,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--recover-invariant-failures` | a broken internal invariant in the Engine worker fails the active and materializing requests and leaves the waiting ones queued, as recovery from out of memory does, instead of failing the Engine; eight consecutive recoveries without a completed unit still fail it | off |
 | `--prefill-chunk N` | text-prefill chunk | `1024`; `4096` for native MoE experts in host memory or files |
 | `--decode-rounds-per-prefill N` | Decode rounds that run before each prefill chunk while other requests generate, so a long prompt does not leave them one token per chunk; proportionally fewer, at least one, before a shorter prefill unit, so a short prompt gets in after one round; `1` alternates strictly, a larger value keeps streams responsive and makes the prompt finish later | `0` (`--prefill-chunk` / 64) |
+| `--prefill-stall-budget-ms N` | While other requests generate, cut each prefill step to the largest multiple of 128 tokens, at least 512, that the prefill cost model predicts to take at most N ms; the model's costs are scaled by the ratio of observed to predicted step times. Every token of the other streams then waits about N ms instead of a whole chunk, and the new prompt prefills slower; a lone prompt keeps the whole chunk. Qwen3.5-family models only | `0` (off) |
 | `--fast-prefill-kernel` | prefill an `int8` or `rk*` KV cache with the fast prompt-attention kernel (FP16 PV accumulation per 64-key tile) and round `--prefill-chunk` down to whole attention waves; on Blackwell, prefill an `nvfp4` KV cache past 2048 visible keys with its fast kernel (QK on block-scaled FP4 Tensor Cores); a small perplexity cost (see [perplexity](perplexity.md)). Without the flag the [device profile](device-profiles.md)'s `attn_prompt_fast` decides, and the built-in profiles turn the kernel on where it measured faster | the device profile |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--log-colours on\|off` | `on` colours the console log's levels and gives every statistic of the operational lines a stable colour; `off` keeps the log plain; a redirected stderr is always plain | levels coloured on a console |
@@ -2185,7 +2190,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--devices A,B,...` | one pipeline stage per listed CUDA device (2 to 8; the cards may differ where the build runs on each; see [pipeline stages](maintainer/pipeline-stages.md)); on the Qwen3.5 family MTP, DFlash, DFlash2 and resident or CPU Vision run across the stages (the Vision tower stays on the first device; `--vision-residency overlay` is refused); overrides `--device` | none |
 | `--stage-layers A,B,...` | layers per stage, in `--devices` order; omitted means a split chosen from each device's free memory | memory-balanced |
 | `--tensor-parallel` | the `--devices` share every layer instead of dividing the layers: GDN heads, KV heads with their query heads and cache, and dense FFN rows or MoE experts per device, the head, the shared expert and MTP on the first; Qwen3.5-core models in every weight format, MoE experts on the devices ([tensor parallelism](maintainer/pipeline-stages.md#tensor-parallelism)); Qwen3.8-Flash-Next by GDN key heads, sparse-attention KV heads and GGUF expert banks on the devices ([its tensor parallelism](maintainer/pipeline-stages.md#tensor-parallelism-of-qwen38-flash-next)); Gemma 4 and Flint divide only their routed experts on the devices, DeepSeek-V4.1-Flash its host or disk experts ([expert parallelism](maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families)) | off |
-| `--tensor-split A,B,...` | with `--tensor-parallel`, the relative size of each device's share, one positive number per `--devices` entry; shares end on whole stored blocks, so the split is the nearest one the weights allow | by each card's measured copy bandwidth, capped by its free memory |
+| `--tensor-split A,B,...` | with `--tensor-parallel`, the relative size of each device's share, one positive number per `--devices` entry; shares end on whole stored blocks, so the split is the nearest one the weights allow | by each card's measured copy bandwidth, capped by its free memory beside the Engine's reservation |
 | `--tensor-attention heads\|positions` | with `--tensor-parallel` on a Qwen3.5-core model, how attention divides: `heads` gives each device a range of KV heads with their query heads and cache planes, the devices past the KV heads holding none; `positions` gives every device every head of the cache pages `p % devices == device`, and the devices merge their partial outputs ([attention by positions](maintainer/pipeline-stages.md#attention-by-positions)) | `heads` |
 | `--invariant-attention` | Qwen3.5-core models: every text attention call of 1 to 16 columns per sequence (64 for one sequence verifying a lookup window longer than 15) reduces its keys in fixed segments of the context, so a column's attention output is the same bytes at any decode width, verification window and batch ([invariant attention](maintainer/qwen3_5-model.md#invariant-attention)); MTP attention keeps its tuned splits | off |
 | `--expert-residency device\|host\|disk` | routed MoE experts on GPU, in pinned host memory, or in artifact files: [native Qwen](maintainer/qwen3_5-model.md#routed-expert-residency), [Gemma 4](gemma4.md#expert-residency), [Flint](flint.md#expert-residency) and [Flash-Next](qwen3-8-flash-next.md#run). Native Qwen, Gemma 4 and Flint bring misses into whole-layer device banks | `device` |
@@ -2236,6 +2241,8 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--ngram-session-mib N` | per-session share of that archive, 1 MiB up to the archive size | `128` |
 | `--ngram-native-sessions` | with the archive, also recognize the session identities Kilo, Codex and Claude send | off |
 | `--prefill-cublas` | hand wide prefill GEMMs to cuBLAS: a large prefill speedup for a small perplexity cost, and it wants a larger `--prefill-chunk` to pay (see [quality trades](maintainer/quality-trade-experiments.md)) | off |
+| `--nvfp4-w4a8-int` | run NVFP4 weights on the int8 tensor cores (W4A8), prefill and decode alike: activations are quantised to int8 with one scale per token and 32 columns, the stored E2M1 codes widen to int8 exactly, and their E4M3 group scales apply in FP32. About 1.2-1.4% relative error from the activation quantisation; on an RTX 50-series card it replaces the W4A4 routes. The device profile's `nvfp4_int8/*` keys choose the wide kernel | off: BF16 activations (W4A16) before Blackwell, W4A4 on it |
+| `--nvfp4-w4a16` | on an RTX 50-series card, run NVFP4 weights on the dequantising BF16-activation routes (W4A16) instead of W4A4, more precise and slower; other cards run them by default, so there it changes nothing. Wins over `--nvfp4-w4a8-int` | off |
 | `--no-prefill-cublas-projections` | with `--prefill-cublas`, keep the attention and GDN input projections off that route | projections on |
 | `--no-prefill-a8` | prefill every projection on the A16 routes instead of the integer-activation ones | integer routes |
 | `--mlp-a8-decode` | integer-activation MLP gate_up at decode and verify widths | off |
@@ -2698,6 +2705,17 @@ ingesting a 4,900-token prompt behind four active streams, the largest inter-tok
 the ingesting request's own prefill rate fell only from 1,135 to 1,130 to 1,110 tok/s. Prefill is
 not batched across requests at any chunk size, so a smaller chunk trades almost no ingestion
 throughput for a proportionally smaller stall. The shipped concurrent launcher uses 512.
+
+A large chunk pays off where a prefill step reads the weights once for all its tokens, as the cuBLAS
+prefill route does (`--prefill-cublas`). `--prefill-stall-budget-ms` keeps that chunk for a prompt
+that prefills alone and cuts a step only while other requests generate: to the largest multiple of
+128 tokens, at least 512, that the prefill cost model, scaled by the observed to predicted step
+times, expects to fit the budget. A deeper prefix costs more attention per token and is cut harder.
+`ninfer:paced_prefill_steps_total` counts the steps it cut and
+`ninfer:paced_prefill_deferred_tokens_total` the prompt tokens they left to later steps. On an RTX
+3090 with Qwen3.8-27B (DFlash2, chunk 2048, cuBLAS prefill), a 15.6K-token prompt arriving next to
+a generating stream paused that stream for up to 0.83 s per step without a budget, 0.35-0.36 s at
+250 ms and 0.59-0.62 s at 500 ms; the new prompt's first token came 11% and 2% later.
 
 Input memory is bounded by the outstanding-request count and the per-request
 `--max-request-mib` limit. Media requests additionally share one preparation permit, so a waiting

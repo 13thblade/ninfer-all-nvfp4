@@ -556,6 +556,8 @@ struct SharedPrefixSlot {
 // gives every occupied request slot its own instance of this state.
 struct RequestControl {
     std::unique_ptr<NgramProposer> ngram;
+    // The build of `ngram` until its first proposal takes it.
+    std::shared_ptr<NgramIndexBuild> ngram_build;
     std::shared_ptr<const NgramSnapshot> ngram_snapshot;
     std::uint64_t ngram_copy_source = 0;
     std::uint32_t ngram_copy_offset = 0;
@@ -769,7 +771,8 @@ public:
     [[nodiscard]] bool try_claim_seal_window() noexcept;
     void release_seal_window() noexcept;
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
-                                                  runtime::ExecutionTiming* failed_timing);
+                                                  runtime::ExecutionTiming* failed_timing,
+                                                  std::uint32_t max_tokens = 0);
     // The sequence's share of a batched pass (advance_prefill_batch), or empty.
     [[nodiscard]] std::optional<PrefillBatchUnit>
     prefill_batch_unit(SequenceHandle sequence) const noexcept;
@@ -1511,7 +1514,8 @@ private:
                         MaterializationTransaction& transaction);
     void release_materialization_staging(MaterializationTransaction& transaction) noexcept;
     [[nodiscard]] runtime::PrefillStepResult
-    advance_prefill_raw(std::uint32_t lane, runtime::ExecutionTiming* failed_timing);
+    advance_prefill_raw(std::uint32_t lane, runtime::ExecutionTiming* failed_timing,
+                        std::uint32_t max_tokens = 0);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_raw(std::span<const std::uint32_t> lanes, std::span<const runtime::RoundBudget> budgets,
                runtime::ExecutionTiming* failed_timing);
@@ -1795,7 +1799,7 @@ private:
                                     runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] runtime::PrefillStepResult
     advance_prefill(SequenceState& sequence, RequestControl& request,
-                    runtime::ExecutionTiming* failed_timing);
+                    runtime::ExecutionTiming* failed_timing, std::uint32_t max_tokens = 0);
     // The lane's share of one pass shared with others: the rest of its prompt, or a branched
     // read's prompt part and the branches that fit after it.
     [[nodiscard]] std::optional<PrefillBatchUnit> prefill_batch_unit(std::uint32_t lane) const;

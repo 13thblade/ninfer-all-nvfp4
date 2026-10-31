@@ -510,6 +510,13 @@ struct EngineOptions {
     // round takes tens of milliseconds and a chunk hundreds, so strict alternation (1) leaves
     // decoding streams a token per chunk; 0 is prefill_chunk / 64.
     std::uint32_t decode_rounds_per_prefill = 0;
+    // While another request generates, a prefill step is cut so the prefill cost model, scaled by
+    // the ratio of observed to predicted step times, predicts it to take at most this many
+    // milliseconds: a multiple of 128 tokens, at least 512. Each token of the other streams then
+    // waits about this long instead of a whole chunk, and the prompt prefills slower, since a
+    // shorter step reads the weights for fewer tokens. 0 runs the planned chunk; at most 60000.
+    // Qwen3.5-family models only.
+    std::uint32_t prefill_stall_budget_ms = 0;
     // Prefill with the fast INT8-KV prompt-attention kernel and round prefill_chunk down to whole
     // prompt-attention waves. Off keeps the default kernel and the requested chunk.
     bool fast_prefill_kernel           = false;

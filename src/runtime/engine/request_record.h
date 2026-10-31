@@ -197,6 +197,9 @@ struct RequestRecord {
     std::uint64_t backfill_epoch         = 0;
     BackfillClass backfill_class         = BackfillClass::None;
     std::uint32_t computed_prompt_tokens = 0;
+    // Prompt tokens of steps cut under the stall budget not yet charged as a whole chunk's quantum
+    // (prefill_step_quanta).
+    std::uint32_t paced_prefill_tokens = 0;
     GenerationTimings generation_timings;
     RequestHostTiming host_timing;
     SpeculativeStats speculative_stats;
