@@ -48,6 +48,8 @@ the fork's git history remains the authoritative record.
 | `557c6e9c` | 2026-10-31 | test(nvfp4): cover a rank's share in the fused SwiGLU and linear_add Op tests |
 | `1069d4d7` | 2026-10-31 | fix(nvfp4-a16): size the unified small-T SwiGLU's output stride from the weight |
 | `7aed8158` | 2026-10-31 | feat(qwen3_5): let --nvfp4-w4a8-int reach a tensor-parallel rank's input projections |
+| `15d39f5c` | 2026-10-31 | feat(nvfp4-int8): let the int8 family write a rank's FP32 partial sum |
+| `a677ba59` | 2026-10-31 | feat(qwen3_5): promote a rank's share of an NVFP4 projection to the int8 route |
 
 `03b78d67` no longer shows in the file lists below: upstream `7cf5b2ae` fixed
 the same defect and the merge `121f8283` took upstream's side, so the fork keeps
@@ -146,15 +148,17 @@ parts rather than as a fused parent, so what runs under `--tensor-parallel` is t
 Linear per segment. The fused share handling is what a caller that binds a rank's fused parent
 needs, and the Op-level tests do not reach it yet.
 
-Under `--tensor-parallel` the `--nvfp4-w4a8-int` switch reaches the column-split attention and
-GDN input projections only, and it had to learn a second carrier to do even that: those
-projections arrive as `PartProjectionWeights` on a rank, where they are stored as their segments,
-and the promotion only knew `SingleProjectionWeight`. Everything else stays on A16, for two
-different reasons: a row-split projection (the FFN's down, and the attention and GDN output
-projections) produces an FP32 partial sum and the int8 family writes BF16, while the FFN's
-column-split gate/up is registered per exact shape (34816 x 5120) and a rank's share (17408 x 5120
-or 8704 x 5120) does not match it. Promoting a share of gate/up would be sound -- its output is
-BF16, and the int8 grouped kernel reads its row count from the weight -- but it is not done here.
+Under `--tensor-parallel` the `--nvfp4-w4a8-int` switch now reaches every NVFP4 projection. Four
+things had to change for that. The family's writer follows the result's dtype, so a rank's FP32
+partial sum is stored as FP32 rather than through the BF16 writer, which filled half of a four-byte
+buffer and left the rest stale. The dispatcher consults the flag before the FP32 general route, so
+an int8 policy answers a partial itself instead of handing it to the A16 composition. The promotion
+admits a rank's share -- rows or columns the parent divides evenly -- and not only the parent's exact
+shape. And the dense FFN's two-parent branch, the one a rank takes because it holds gate and up as
+separate device objects, applies those promotions at all: it had been returning before any route
+promotion ran, which is why the FFN's two largest GEMMs stayed on A16 while the rest of the rank's
+projections were already covered. The two-parent form runs each product into an unrounded FP32 plane
+and SwiGLUs afterwards, so an int8 gate there lands in exactly the plane the FP32 writer produces.
 
 Tensor parallelism is not bit-identical to one device by construction: the ranks' FP32 partials
 are summed in rank order and rounded once, a different association of the same terms than a single
