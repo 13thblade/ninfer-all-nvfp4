@@ -82,10 +82,22 @@ public:
     // MMA every sm_80+ part runs. Registered per exact shape like the integer routes.
     void nvfp4_int8_route(LinearParameters& p, std::int32_t n, std::int32_t k) const {
         if (!model_.options().nvfp4_w4a8_int || model_.options().nvfp4_w4a16) { return; }
-        if ((p.policy == ops::LinearPolicy::A16Only || p.policy == ops::LinearPolicy::AllowA4) &&
-            p.weight.qtype == QType::NVFP4 && p.weight.n == n && p.weight.k == k) {
-            p.policy = ops::LinearPolicy::AllowNvfp4Int8;
+        if (p.policy != ops::LinearPolicy::A16Only && p.policy != ops::LinearPolicy::AllowA4) {
+            return;
         }
+        if (p.weight.qtype != QType::NVFP4) { return; }
+        const auto& w = p.weight;
+        // A rank binds the same projection at its share of the divided dimension: gate and up rows
+        // over the rank count, or down columns over it. Admit those as well as the whole shape --
+        // the family reads both dimensions at launch time and writes whichever dtype the result
+        // names, so a share is a shape it can serve. The alignment is the launcher's: rows a whole
+        // 128-tile, K a whole 64-group (four G16 blocks).
+        const bool whole        = w.n == n && w.k == k;
+        const bool column_share = w.k == k && w.n > 0 && w.n < n && (n % w.n) == 0;
+        const bool row_share    = w.n == n && w.k > 0 && w.k < k && (k % w.k) == 0;
+        if (!(whole || column_share || row_share)) { return; }
+        if ((w.n % 128) != 0 || (w.k % 64) != 0) { return; }
+        p.policy = ops::LinearPolicy::AllowNvfp4Int8;
     }
 
     // --nvfp4-w4a16 asks a native-FP4 card for the dequantising A16 routes instead of A4. On every
@@ -206,7 +218,16 @@ public:
                     out.gate_up = ops::prepare_linear_weight(gate);
                     out.up      = ops::prepare_linear_weight(up);
                 }
-                out.down                  = rotated_linear(w.down);
+                out.down = rotated_linear(w.down);
+                // A rank holds gate and up as two parents of the projection the joined form
+                // registers: gate rows of 17408 -- over the rank count -- and down columns of
+                // 17408. Promote on those parent shapes. The two-parent form runs each product
+                // through its own Linear into an unrounded plane, so an int8 gate or up takes the
+                // family's FP32 writer, which is exactly what that plane is.
+                nvfp4_w4a16_route(out.gate_up, 17408, 5120);
+                nvfp4_w4a16_route(out.down, 5120, 17408);
+                nvfp4_int8_route(out.gate_up, 17408, 5120);
+                nvfp4_int8_route(out.down, 5120, 17408);
                 out.verify_gate_up_policy = out.gate_up.policy;
                 return out;
             });
