@@ -56,7 +56,9 @@
 
 本机只有一张卡，所以 2/4 rank 是让多个 rank **共享同一设备**跑的（`--devices 0,0` / `0,0,0,0`，传输走 Peer）：验证的是切分、规约与数值，跨卡的带宽差异测不出来。
 
-TP 下 W4A8-int 的覆盖范围比单卡窄：行切投影（FFN 的 gate/up、down 和 mixer 输出投影）的偏置和必须是 FP32，而 int8 族只写 BF16，所以这些走 A16 通用路径，只有输出为 BF16 的列切投影（attention 与 GDN 输入投影）走 int8 内核。这也让两行在 TP 下几乎相同。
+TP 下每个投影只有两种切法：**列切**（切输出行，各 rank 算自己那几行，拼起来即完整结果，输出仍是 BF16）和**行切**（切输入列，各 rank 只算 K 的一段，产出的是一份偏置和，再由各 rank 相加）。行切的那份偏置和必须是 FP32，而 int8 族只写 BF16，所以**凡行切投影**——FFN 的 down、attention 与 GDN 的输出投影——在 TP 下必然走 A16 通用路径。
+
+列切的本可以让 int8 来算，实际只有 attention 与 GDN 的输入投影真的走了 int8 内核（它们的提升已学会认 TP 的 parts 载体）。FFN 的 gate/up 虽然也是列切、输出 BF16，但 `--nvfp4-w4a8-int` 是按整幅形状注册的（认 34816×5120），一个 rank 的 share 是 17408×5120 或 8704×5120，不匹配就提升不了，因此也停在 A16。FFN 这两块最大的 GEMM 在两行里都是 A16，这就是两行 PPL 在 TP 下几乎相同的原因——它反映的是**覆盖范围**接近，并不代表速度相同。
 
 ### 下一步
 
@@ -126,11 +128,19 @@ This machine has one card, so the two- and four-rank runs put several ranks on *
 (`--devices 0,0` / `0,0,0,0`, Peer transport): they exercise the division, the reductions and the
 numerics, not the bandwidth between cards.
 
-Under tensor parallelism the W4A8-int route covers less than on one device: a row-split
-projection's partial sum (the FFN's gate/up, its down and the mixer output projection) must be
-FP32, and the int8 family writes BF16, so those run the general A16 route; only the column-split
-projections, whose output is BF16 (the attention and GDN input projections), run the int8 kernels.
-That is why the two rows nearly coincide there.
+Under tensor parallelism a projection is split one of two ways. A column-parallel one divides
+output rows: each rank computes its own rows, the pieces concatenate, and the output is BF16 as
+anywhere else. A row-parallel one divides input columns: each rank sums over its slice of K and the
+ranks add those partials. Such a partial must be FP32, and the int8 family writes BF16, so every
+row-split projection -- the FFN's down, and the attention and GDN output projections -- runs the
+general A16 route under tensor parallelism.
+
+Column-split ones could take int8, and two do: the attention and GDN input projections, whose
+promotion learned the parts carrier a rank binds them as. The FFN's gate/up does not: the flag
+registers a route per exact shape (34816 x 5120) and a rank's share is 17408 x 5120 or
+8704 x 5120, so it stays on A16 as well. The FFN's two largest GEMMs therefore run A16 on both
+routes, which is why the two rows' perplexities nearly coincide -- that is about coverage, not
+about speed.
 
 ## Next steps
 

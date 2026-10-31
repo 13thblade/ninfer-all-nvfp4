@@ -149,8 +149,12 @@ needs, and the Op-level tests do not reach it yet.
 Under `--tensor-parallel` the `--nvfp4-w4a8-int` switch reaches the column-split attention and
 GDN input projections only, and it had to learn a second carrier to do even that: those
 projections arrive as `PartProjectionWeights` on a rank, where they are stored as their segments,
-and the promotion only knew `SingleProjectionWeight`. A row-split projection keeps running A16
-under the flag, because its partial sum is FP32 and the int8 family writes BF16.
+and the promotion only knew `SingleProjectionWeight`. Everything else stays on A16, for two
+different reasons: a row-split projection (the FFN's down, and the attention and GDN output
+projections) produces an FP32 partial sum and the int8 family writes BF16, while the FFN's
+column-split gate/up is registered per exact shape (34816 x 5120) and a rank's share (17408 x 5120
+or 8704 x 5120) does not match it. Promoting a share of gate/up would be sound -- its output is
+BF16, and the int8 grouped kernel reads its row count from the weight -- but it is not done here.
 
 Tensor parallelism is not bit-identical to one device by construction: the ranks' FP32 partials
 are summed in rank order and rounded once, a different association of the same terms than a single
