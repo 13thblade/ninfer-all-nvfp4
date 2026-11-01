@@ -45,14 +45,18 @@
 
 ### 精度
 
-生产档（`--device-profile calibrate`）下的语料困惑度，同一制品、`perplexity-1m` 语料 `--quick`、16,384 token 窗口、打分 token 数 261,167、KV bf16：
+生产档（`--device-profile calibrate`）下的语料困惑度，同一制品、`perplexity-1m` 语料 `--quick`、16,384 token 窗口、窗口互不重叠（`--disjoint`）、打分 196,596 token、KV bf16；上游 #194 起按 FP32 logits 打分：
 
-| 通路       | 单卡 PPL | 张量并行 2 rank | 张量并行 4 rank |
-| ---------- | -------- | --------------- | --------------- |
-| W4A16      | 4.222596 | 4.224089        | 4.222890        |
-| W4A8-int   | 4.220410 | 4.221694        | 4.223560        |
+| 通路     | 单卡    | 2 rank（1:1） | 4 rank（1:1:1:1） | 2 rank（1:2） | 2 rank（2:1） |
+| -------- | ------- | ------------- | ----------------- | ------------- | ------------- |
+| W4A16    | 4.15323 | 4.15279       | 4.15303           | 4.15312       | 4.15276       |
+| W4A8-int | 4.15388 | 4.15423       | 4.15425           | 4.15529       | 4.15476       |
+
+W4A16 各行与单卡相差不超过 0.011%，W4A8-int 不超过 0.034%；同一配置下 W4A8-int 比 W4A16 高 0.016–0.052%，是 s8 激活量化的固有代价。不均匀切分两个方向都会移动，且 1:2 与 2:1 的偏移方向相反，说明差异来自算术路径而非精度劣化。
 
 本机只有一张卡，2/4 rank 是多 rank 共享同一设备跑出来的，只做功能与数值验证，不含性能测试。PPL 的波动是多 rank 之间 FP32 累加改变了原计算路径导致的，并非劣化。内核的数值精度仍满足上游的对照测试要求：按其 Op 开发规范（`docs/maintainer/op-development.md`）对独立的 naive FP32/FP64 oracle 验收，融合 Op 用完整的融合公式作 oracle 而不是拼接生产 Op，也不以另一条 GPU 路径或成对实现一致作为判据。
+
+**跨切分比较请用 `--disjoint`。** 默认的滑动窗口协议（`--stride 8192`，打分 261,167 token）下，不均匀切分会先测出最高约 0.1% 的偏高（W4A16 1:2 为 4.22505 对单卡 4.22161，W4A8-int 为 4.22430 对 4.21966）：`--stride` 小于 `--context` 时每个窗口要重新预填 8,192 token 的重叠前缀，chunk 形状随之改变、归约顺序不同，个别 bf16 KV 值偏移 1 ULP，再被单个尾窗放大（该窗占总差异约 85%）。判据是同一形状把 1:2 换成 2:1 会反向移动（−0.017%）、`--invariant-attention` 无影响、`--disjoint` 下所有切分回到 0.034% 以内。`docs/perplexity.md` 给出 `--disjoint` 的定义，`docs/gemma4.md` 的对比规则也说明滑动窗口不复现独立窗口的分数。
 
 ### 下一步
 
@@ -105,14 +109,18 @@ One thing about the table: **upstream throws**, hence the empty row. The fused N
 
 ## Perplexity
 
-Corpus perplexity on the production profile (`--device-profile calibrate`): same artifact, the `--quick` stream set of the `perplexity-1m` corpus, 16,384-token window, 261,167 scored tokens, KV bf16.
+Corpus perplexity on the production profile (`--device-profile calibrate`): same artifact, the `--quick` stream set of the `perplexity-1m` corpus, 16,384-token window, disjoint windows (`--disjoint`), 196,596 scored tokens, KV bf16; scored on FP32 logits since upstream #194.
 
-| Route      | PPL, one GPU | PPL, tensor parallel 2 ranks | PPL, tensor parallel 4 ranks |
-| ---------- | ------------ | ---------------------------- | ---------------------------- |
-| W4A16      | 4.222596     | 4.224089                     | 4.222890                     |
-| W4A8-int   | 4.220410     | 4.221694                     | 4.223560                     |
+| Route    | 1 device | 2 ranks (1:1) | 4 ranks (1:1:1:1) | 2 ranks (1:2) | 2 ranks (2:1) |
+| -------- | -------- | ------------- | ----------------- | ------------- | ------------- |
+| W4A16    | 4.15323  | 4.15279       | 4.15303           | 4.15312       | 4.15276       |
+| W4A8-int | 4.15388  | 4.15423       | 4.15425           | 4.15529       | 4.15476       |
+
+W4A16 stays within 0.011% of the single-device value and W4A8-int within 0.034%; at the same split W4A8-int sits 0.016 to 0.052% above W4A16, the cost s8 activations carry. An uneven split moves in both directions — 1:2 and 2:1 part the same shapes to opposite sides — so the difference is the arithmetic path, not lost quality.
 
 This machine has one card, so the two- and four-rank rows put several ranks on one shared device: they verify function and numerics, not multi-GPU performance. The PPL movement is the multi-rank arithmetic path itself — a row-split rank writes an FP32 partial and the ranks add those before one rounding, where a single device accumulates in place — not a quality regression. The kernels keep upstream's Op qualification ([`docs/maintainer/op-development.md`](docs/maintainer/op-development.md)): each fused route is checked against an independent naive FP32/FP64 oracle over the logical values its inputs represent, a fused oracle evaluating the complete fused formula rather than a composition of production Ops, and neither another GPU route nor pairwise implementation parity stands as that oracle.
+
+**Compare splits with `--disjoint`.** Under the default sliding-window protocol (`--stride 8192`, 261,167 scored tokens) an uneven split first measures up to ~0.1% high: W4A16 4.22505 against 4.22161 at 1:2, W4A8-int 4.22430 against 4.21966. With `--stride` below `--context` every window re-prefills an 8,192-token overlap, and a different chunk shape changes the reduction order, so a bf16 KV entry can land 1 ULP away; one tail window then carries ~85% of the gap. The tell is that 1:2 against 2:1 moves the same shapes in the opposite direction (−0.017%), `--invariant-attention` changes nothing, and `--disjoint` brings every split back within 0.034%. [`docs/perplexity.md`](docs/perplexity.md) defines `--disjoint`, and [`docs/gemma4.md`](docs/gemma4.md) already notes that a strided run does not reproduce its own fresh-window scores.
 
 ## Next steps
 

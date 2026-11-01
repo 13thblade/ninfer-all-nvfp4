@@ -13,7 +13,7 @@ the fork's git history remains the authoritative record.
 | Upstream project | NInfer-all, https://github.com/iamwavecut/ninfer-all |
 | Upstream copyright | The NInfer-all contributors (see CONTRIBUTORS.md) |
 | Base commit | `78fd39aaeca75b454748d5a1281278112e34d5ce` (upstream master) |
-| Upstream sync | six merges: `f2675499` took `63428ac2`, `63b68fdc` took `b3402a6f`, `121f8283` took `a53a4f33`, `78a5bbc9` took `3d882fc1`, `ec07d895` took `78fd39aa`, `aa55653e` took `3fda3165`. The fork was cut at `e1f2d961`; the commits between those bases are recorded by the merge commits themselves |
+| Upstream sync | eight merges: `f2675499` took `63428ac2`, `63b68fdc` took `b3402a6f`, `121f8283` took `a53a4f33`, `78a5bbc9` took `3d882fc1`, `ec07d895` took `78fd39aa`, `aa55653e` took `3fda3165`, `733df513` took `0da43c3e`, `f7a6dbd2` took `8bde0c06`. The fork was cut at `e1f2d961`; the commits between those bases are recorded by the merge commits themselves |
 | Fork repository | https://github.com/13thblade/ninfer-all-nvfp4 |
 | License | Apache License 2.0, see LICENSE (unchanged from upstream) |
 
@@ -48,8 +48,17 @@ the fork's git history remains the authoritative record.
 | `557c6e9c` | 2026-10-31 | test(nvfp4): cover a rank's share in the fused SwiGLU and linear_add Op tests |
 | `1069d4d7` | 2026-10-31 | fix(nvfp4-a16): size the unified small-T SwiGLU's output stride from the weight |
 | `7aed8158` | 2026-10-31 | feat(qwen3_5): let --nvfp4-w4a8-int reach a tensor-parallel rank's input projections |
+| `245f3ad2` | 2026-10-31 | docs: record the tensor-parallel work, its route coverage and its measured perplexity |
+| `c6fcd491` | 2026-10-31 | docs: correct the split topology in the tensor-parallel coverage note |
 | `15d39f5c` | 2026-10-31 | feat(nvfp4-int8): let the int8 family write a rank's FP32 partial sum |
 | `a677ba59` | 2026-10-31 | feat(qwen3_5): promote a rank's share of an NVFP4 projection to the int8 route |
+| `75bffc0b` | 2026-10-31 | docs: record that the int8 route now covers every projection under tensor parallelism |
+| `53e3d2c8` | 2026-10-31 | docs: trim the tensor-parallel note to what this machine can measure |
+| `733df513` | 2026-10-31 | Merge upstream master 0da43c3e into the fork |
+| `d7240963` | 2026-10-31 | docs(readme): say why the tensor-parallel PPL rows move |
+| `623a3da8` | 2026-10-31 | docs(readme): name the Op oracle the tensor-parallel kernels are checked against |
+| `f7a6dbd2` | 2026-11-01 | Merge upstream master 8bde0c06 into the fork |
+| `7d7ca487` | 2026-11-02 | fix(nvfp4): take a tensor-parallel share that does not divide its parent |
 
 `03b78d67` no longer shows in the file lists below: upstream `7cf5b2ae` fixed
 the same defect and the merge `121f8283` took upstream's side, so the fork keeps
@@ -57,25 +66,28 @@ no change to that file.
 
 The two nvfp4 commits above are master's own history. The branches carried for
 review against upstream are rebased equivalents of them on top of the current
-base: `pr/nvfp4-w4a16` = `18491bed` and `pr/nvfp4-w4a8-int` = `220dbfb1`.
-Neither branch is in master's ancestry; their content is. `220dbfb1` carries the
-same patch-id as `05c47ff8` across both later rebases, and `18491bed` differs
-from `b76d912e` only by the `gguf_only` gate named below.
+base: `pr/nvfp4-w4a16` = `18491bed` and `pr/nvfp4-w4a8-int` = `220dbfb1`, and
+`pr/nvfp4-tp` = `af169a79`, the tensor-parallel work as one commit on
+`8bde0c06`. No review branch is in master's ancestry; their content is.
+`220dbfb1` carries the same patch-id as `05c47ff8` across both later rebases,
+and `18491bed` differs from `b76d912e` only by the `gguf_only` gate named
+below.
 
 ## Change summary
 
-Relative to the fork base this fork:
+Relative to upstream master (`8bde0c06`) this fork:
 
-- modifies 111 existing upstream files;
-- adds 29 new files;
+- modifies 29 existing upstream files;
+- adds 1 new file (this record);
 - deletes no upstream files.
 
-The functional changes add the NVFP4 W4A16 (BF16) route for pre-Blackwell GPUs,
-the NVFP4 W4A8-int route on the s8 tensor cores across all supported widths,
-the KV dequant path they share, the route selection and command-line switches
-(`--nvfp4-w4a16`, `--nvfp4-w4a8-int`), and the accompanying Op-level and
-real-data tests, benchmarks, build entries and documentation. The README
-contains the measured results and their basis.
+What this fork added earlier — the NVFP4 W4A16 (BF16) and W4A8-int routes for
+pre-Blackwell GPUs, the KV dequant path they share, and the Op-level and
+real-data tests behind them — is upstream's since #192, so it no longer shows
+as a difference. What remains is the tensor-parallel work on those routes (a
+rank's share of every projection the fused SwiGLU, linear_add and attention and
+GDN input projections carry, plus the int8 family's FP32 partial sum), the
+sm_89 build arch in the Docker image, and the README's measurements.
 
 The upstream sync merge `f2675499` touched three files where both sides grew
 the `ffn()` parameter list. The fork's `input_norm` and upstream's `partial`
@@ -153,8 +165,11 @@ things had to change for that. The family's writer follows the result's dtype, s
 partial sum is stored as FP32 rather than through the BF16 writer, which filled half of a four-byte
 buffer and left the rest stale. The dispatcher consults the flag before the FP32 general route, so
 an int8 policy answers a partial itself instead of handing it to the A16 composition. The promotion
-admits a rank's share -- rows or columns the parent divides evenly -- and not only the parent's exact
-shape. And the dense FFN's two-parent branch, the one a rank takes because it holds gate and up as
+admits a rank's share -- rows or columns the parent holds, a whole 128-row tile and a whole 64-group,
+the alignment the int8 launcher asks of any shape it serves -- and not only the parent's exact
+shape; an even division is not required, because `--tensor-split` sizes the ranks by measured
+bandwidth and an uneven share used to leave every rank of that layer on A16. And the dense FFN's
+two-parent branch, the one a rank takes because it holds gate and up as
 separate device objects, applies those promotions at all: it had been returning before any route
 promotion ran, which is why the FFN's two largest GEMMs stayed on A16 while the rest of the rank's
 projections were already covered. The two-parent form runs each product into an unrounded FP32 plane
@@ -167,218 +182,69 @@ identical, and one rounding where a single device rounds once -- and the README'
 perplexity shows the difference that leaves.
 
 The lists below are generated from `git diff --name-status upstream/master..HEAD`
-with `upstream/master` at `3fda3165`. Files marked as modified are upstream
+with `upstream/master` at `8bde0c06`. Files marked as modified are upstream
 files changed by this fork; files marked as added are new in this fork.
 
-## Modified files (111)
+## Modified files (29)
 
-### Root, build and documentation (4)
+### Root, build and documentation (3)
 
 - `Dockerfile`
 - `README.md`
 - `docker/entrypoint.sh`
-- `docs/device-profiles.md`
 
-### apps (5)
+### src/models/qwen3_5 (1)
 
-- `apps/calibrate/main.cpp`
-- `apps/cli/main.cpp`
-- `apps/cli/options.cpp`
-- `apps/cli/options.h`
-- `apps/perplexity/main.cpp`
-
-### bench (2)
-
-- `bench/ops/linear_bench.cu`
-- `bench/ops/nvfp4_linear_swiglu_bench.cu`
-
-### include (4)
-
-- `include/ninfer/engine_options.h`
-- `include/ninfer/ops/attn_input_proj.h`
-- `include/ninfer/ops/linear.h`
-- `include/ninfer/ops/linear_swiglu.h`
-
-### src/calibration (3)
-
-- `src/calibration/device_calibration.cu`
-- `src/calibration/device_calibration.h`
-- `src/calibration/route_catalog.cpp`
-
-### src/models (5)
-
-- `src/models/load_options.h`
-- `src/models/qwen3_5/execution/ffn.cpp`
-- `src/models/qwen3_5/execution/ffn.h`
 - `src/models/qwen3_5/execution/parameters.cpp`
-- `src/models/qwen3_5/execution/text.cpp`
 
-### src/ops/attn_input_proj (9)
+### src/ops/attn_input_proj (3)
 
 - `src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_a16.cu`
-- `src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_decode.cu`
-- `src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_decode_unified.cu`
+- `src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_int8.cu`
 - `src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_output.cuh`
-- `src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.cpp`
-- `src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h`
-- `src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan_unified.cpp`
-- `src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan_unified.h`
-- `src/ops/attn_input_proj/sources.cmake`
 
-### src/ops/gdn_input_proj (12)
+### src/ops/gdn_input_proj (3)
 
 - `src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_a16.cu`
-- `src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_decode.cu`
-- `src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_decode_unified.cu`
-- `src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.cpp`
-- `src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan_unified.cpp`
-- `src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan_unified.h`
+- `src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_int8.cu`
 - `src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_output_unified.cuh`
-- `src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_decode.cu`
-- `src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_decode_unified.cu`
-- `src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.cpp`
-- `src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan_unified.cpp`
-- `src/ops/gdn_input_proj/sources.cmake`
 
-### src/ops/kv_cache (2)
+### src/ops/linear (2)
 
-- `src/ops/kv_cache/fp8_e4m3_row_codec.cuh`
-- `src/ops/kv_cache/nvfp4_group16_codec.cuh`
-
-### src/ops/linear (27)
-
-- `src/ops/linear/common/output.cuh`
-- `src/ops/linear/common/route_table.cpp`
-- `src/ops/linear/linear.cpp`
-- `src/ops/linear/nvfp4/nvfp4_a16_gemv.cuh`
-- `src/ops/linear/nvfp4/nvfp4_a16_mma.cuh`
-- `src/ops/linear/nvfp4/nvfp4_a16_simt.cuh`
-- `src/ops/linear/nvfp4/nvfp4_a16_sliced_k_mma.cuh`
-- `src/ops/linear/nvfp4/nvfp4_codec.cuh`
-- `src/ops/linear/nvfp4/nvfp4_codec_unified.cuh`
 - `src/ops/linear/nvfp4/nvfp4_dispatch.cpp`
-- `src/ops/linear/nvfp4/nvfp4_dispatch_unified.cpp`
-- `src/ops/linear/nvfp4/nvfp4_gemv.cuh`
-- `src/ops/linear/nvfp4/nvfp4_instances.cuh`
-- `src/ops/linear/nvfp4/nvfp4_shapes_unified.h`
-- `src/ops/linear/nvfp4/nvfp4_simt.cuh`
-- `src/ops/linear/nvfp4/shapes/n14336_k5120.cu`
-- `src/ops/linear/nvfp4/shapes/n14336_k5120_unified.cu`
-- `src/ops/linear/nvfp4/shapes/n16384_k5120.cu`
-- `src/ops/linear/nvfp4/shapes/n16384_k5120_unified.cu`
-- `src/ops/linear/nvfp4/shapes/n34816_k5120.cu`
-- `src/ops/linear/nvfp4/shapes/n34816_k5120_unified.cu`
-- `src/ops/linear/nvfp4/shapes/n5120_k17408.cu`
-- `src/ops/linear/nvfp4/shapes/n5120_k17408_unified.cu`
-- `src/ops/linear/nvfp4/shapes/n5120_k6144.cu`
-- `src/ops/linear/nvfp4/shapes/n5120_k6144_unified.cu`
-- `src/ops/linear/nvfp4/sources.cmake`
-- `src/ops/linear/t2/t2_dispatch.cpp`
+- `src/ops/linear/nvfp4/nvfp4_int8_grouped.cu`
 
-### src/ops/linear_add (7)
+### src/ops/linear_add (4)
 
 - `src/ops/linear_add/nvfp4/nvfp4_linear_add_a16.cu`
-- `src/ops/linear_add/nvfp4/nvfp4_linear_add_decode.cu`
-- `src/ops/linear_add/nvfp4/nvfp4_linear_add_decode_unified.cu`
+- `src/ops/linear_add/nvfp4/nvfp4_linear_add_int8.cu`
 - `src/ops/linear_add/nvfp4/nvfp4_linear_add_plan.cpp`
 - `src/ops/linear_add/nvfp4/nvfp4_linear_add_plan_unified.cpp`
-- `src/ops/linear_add/nvfp4/nvfp4_linear_add_plan_unified.h`
-- `src/ops/linear_add/sources.cmake`
 
-### src/ops/linear_swiglu (8)
+### src/ops/linear_swiglu (5)
 
+- `src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_a16_mma.cu`
 - `src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_decode.cu`
-- `src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_decode_unified.cu`
-- `src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.cpp`
-- `src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h`
-- `src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan_unified.cpp`
-- `src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan_unified.h`
+- `src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_int8_grouped.cu`
 - `src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_small_t.cu`
-- `src/ops/linear_swiglu/sources.cmake`
+- `src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_small_t_unified.cu`
 
-### src/ops/wrapper (4)
+### src/ops/wrapper (2)
 
-- `src/ops/wrapper/attn_input_proj.cpp`
-- `src/ops/wrapper/gdn_input_proj.cpp`
 - `src/ops/wrapper/linear_add.cpp`
 - `src/ops/wrapper/linear_swiglu.cpp`
 
-### src/serve (4)
-
-- `src/serve/generation_service.cpp`
-- `src/serve/request_log.cpp`
-- `src/serve/serve_options.cpp`
-- `src/serve/serve_options.h`
-
-### tests (14)
+### tests (6)
 
 - `tests/CMakeLists.txt`
 - `tests/cmake/NinferTests.cmake`
-- `tests/ops/linear/linear_test_common.cpp`
-- `tests/ops/linear/linear_test_common.h`
-- `tests/ops/linear/test_nvfp4_a16.cpp`
-- `tests/ops/linear/tests.cmake`
-- `tests/ops/linear_swiglu/linear_swiglu_test_common.cpp`
-- `tests/ops/linear_swiglu/linear_swiglu_test_common.h`
+- `tests/ops/linear/test_nvfp4_int8.cpp`
 - `tests/ops/linear_add/test_nvfp4.cpp`
+- `tests/ops/linear_swiglu/linear_swiglu_test_common.cpp`
 - `tests/ops/linear_swiglu/test_nvfp4.cpp`
-- `tests/ops/op_tester.h`
-- `tests/ops/quantized_weight.h`
-- `tests/ops/test_gdn_input_proj_conv_snapshot.cpp`
-- `tests/ops/tests.cmake`
 
-### tools (1)
+## Added files (1)
 
-- `tools/w4a8_inner_loop_probe.cu`
-
-## Added files (29)
-
-### root (1)
+### Root, build and documentation (1)
 
 - `MODIFICATIONS.md`
-
-### src/ops/attn_input_proj (1)
-
-- `src/ops/attn_input_proj/nvfp4/nvfp4_attn_input_int8.cu`
-
-### src/ops/gdn_input_proj (1)
-
-- `src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_int8.cu`
-
-### src/ops/linear (18)
-
-- `src/ops/linear/nvfp4/nvfp4_e4m3_scale.h`
-- `src/ops/linear/nvfp4/nvfp4_int8_fused_norm_quant.cu`
-- `src/ops/linear/nvfp4/nvfp4_int8_fused_norm_quant.cuh`
-- `src/ops/linear/nvfp4/nvfp4_int8_fused_norm_quant.h`
-- `src/ops/linear/nvfp4/nvfp4_int8_grouped.cu`
-- `src/ops/linear/nvfp4/nvfp4_int8_grouped_host.h`
-- `src/ops/linear/nvfp4/nvfp4_int8_grouped_mma.cuh`
-- `src/ops/linear/nvfp4/nvfp4_int8_narrow_host.h`
-- `src/ops/linear/nvfp4/nvfp4_int8_narrow_launch.cuh`
-- `src/ops/linear/nvfp4/nvfp4_int8_narrow_mma.cuh`
-- `src/ops/linear/nvfp4/nvfp4_int8_route.h`
-- `src/ops/linear/nvfp4/nvfp4_mmq_host.h`
-- `src/ops/linear/nvfp4/nvfp4_mmq_launch.cuh`
-- `src/ops/linear/nvfp4/nvfp4_mmq_mma.cuh`
-- `src/ops/linear/nvfp4/nvfp4_mmvq_host.h`
-- `src/ops/linear/nvfp4/nvfp4_mmvq_launch.cuh`
-- `src/ops/linear/nvfp4/nvfp4_mmvq_mma.cuh`
-- `src/ops/linear/nvfp4/shapes/n8192_k4096_unified.cu`
-
-### src/ops/linear_add (1)
-
-- `src/ops/linear_add/nvfp4/nvfp4_linear_add_int8.cu`
-
-### src/ops/linear_swiglu (3)
-
-- `src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_a16_mma.cu`
-- `src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_int8_grouped.cu`
-- `src/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_int8_grouped.cuh`
-
-### tests (4)
-
-- `tests/fixtures/nvfp4_int8_real/generate_fixture.py`
-- `tests/ops/linear/test_nvfp4_int8.cpp`
-- `tests/ops/linear/test_nvfp4_int8_fused_norm.cpp`
-- `tests/ops/test_nvfp4_int8_real.cpp`
