@@ -71,7 +71,7 @@ Hybrid mode configures itself: the only capacity a deployment chooses is `--host
 | §11.2 KV transfer Op | copy-engine path only (`cudaMemcpy2DAsync` runs over consecutive pages and slabs) |
 | §6.3 persistent backfill proof | not issued: a blocked FIFO head is never overtaken (a proof with a growth reserve moved latency from short to long requests without a net gain, §6.3) |
 | §12 optional features other than 12.1 and 12.2, §13.2 Op qualification | not implemented |
-| §13.3 real-artifact scenarios | `ninfer_qwen3_5_hybrid_prefix_real_test`: Host vs Device restore exactness (with and without MTP), generation-opener and system-block reuse, Device-only mode, protocol cache hints, Vision, persistence across a restart; `NINFER_HYBRID_KV_DTYPE` runs them for every KV storage (bf16, int8, fp8, nvfp4, k8v4 pass). `ninfer_ngram_concurrent_real` runs on Hybrid with `NINFER_NGRAM_TEST_CONTEXT_CACHE=hybrid` |
+| §13.3 real-artifact scenarios | `ninfer_qwen3_5_hybrid_prefix_real_test`: Host vs Device restore exactness (with and without MTP), generation-opener and system-block reuse, Device-only mode, protocol cache hints, Vision, persistence across a restart, a repeated prompt on one lane whose pool is its context (`full-pool`, §6.3); `NINFER_HYBRID_KV_DTYPE` runs them for every KV storage (bf16, int8, fp8, nvfp4, k8v4 pass). `ninfer_ngram_concurrent_real` runs on Hybrid with `NINFER_NGRAM_TEST_CONTEXT_CACHE=hybrid` |
 
 ## 0. Summary
 
@@ -508,6 +508,14 @@ Every unpinned Device-resident cache entry (node or snapshot tail) owns its page
 exclusively, so evicting one returns exactly one page to each pool and the arithmetic is exact.
 Exact-frontier tap tails are copied into their own pages for this reason (§7.4). Candidates with a
 block another admission is still filling are skipped.
+
+Neither a tap's tail copy nor the tail an admission pins while it copies it is part of any
+entitlement. The derived output budget (`Engine::concurrent_output_budget`, the serving default
+output limit) therefore leaves `max_new_taps + 1` pages of each pool free beside a lane's
+entitlement. Without them, one lane over a pool no larger than its context reserves every page, and
+a repeated prompt (an OCR page sent again, a regenerated answer) prefills from the root. A request
+whose explicit limit fills the pool still runs, publishing no tailed tap and resuming from no tailed
+snapshot.
 
 ### 6.4 Admit
 
@@ -1198,6 +1206,7 @@ dflash2}.
 | cancellation mid-prefill | taps and completed blocks published; next identical request reuses them |
 | Vision: same image vs different image, identical tokens | hit vs miss; no resume inside a span |
 | pressure with active growth | active request extends by evicting cache; bounded completion unchanged |
+| one lane, pool = context, derived budget | the repeat of a prompt resumes at its generation opener (§6.3) |
 | host cache 0 | device-only cache works; unbacked eviction deletes subtrees correctly |
 | `Disabled` request | tree and snapshot counts unchanged |
 | protocol usage | `cached_tokens` / `cache_read_input_tokens` equal `reuse_tokens`; streaming `message_start` exact |

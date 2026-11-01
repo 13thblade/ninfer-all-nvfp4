@@ -1103,6 +1103,10 @@ public:
     // worker resumes the transaction as soon as it can progress. Returns false, without
     // waiting, when no transfer is in flight. A failed transfer surfaces at the next progress.
     [[nodiscard]] bool wait_context_transfer() noexcept;
+    // The tokens a planned prefill step computes: EngineOptions::prefill_chunk, aligned to the
+    // attention's waves for an INT8-family KV cache. A request's service projection counts its
+    // prefill steps in this unit.
+    [[nodiscard]] std::uint32_t prefill_chunk() const noexcept;
     // Runs one prefill step. `max_tokens` (0: none) cuts a text step below the planned chunk, as a
     // capture frontier cuts it; a step through a media item runs as planned.
     [[nodiscard]] PrefillProgress
@@ -1274,9 +1278,10 @@ public:
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     [[nodiscard]] ExpertResidencyStats expert_residency_stats() const;
     // Largest output budget for a prompt of `prompt_tokens` whose admission entitlement (main KV and
-    // any MTP/DFlash backend KV, draft window included) fits one lane's share of each pool, so that
-    // every configured lane can hold such a request at once; clamped to the remaining context. Reads
-    // only fixed startup capacities, so any thread may call it.
+    // any MTP/DFlash backend KV, draft window included) fits one lane's share of each pool beside
+    // the pages the context cache's snapshot tails take, so that every configured lane can hold
+    // such a request at once; clamped to the remaining context. Reads only fixed startup
+    // capacities, so any thread may call it.
     [[nodiscard]] std::uint32_t concurrent_output_budget(std::uint32_t prompt_tokens) const noexcept;
     void reset_memory_peaks() noexcept;
 

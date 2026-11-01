@@ -1,8 +1,10 @@
 #include "runtime/engine/prefill_pacing.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <iostream>
 #include <random>
+#include <vector>
 
 namespace {
 
@@ -90,28 +92,58 @@ int main() {
                           prefill_step_quanta(true, 896, 2048, carried) == 0 &&
                           prefill_step_quanta(true, 896, 2048, carried) == 1 && carried == 640,
                       "cut steps must charge one quantum per whole chunk");
-    failures += check(prefill_step_quanta(false, 100, 2048, carried) == 1 && carried == 640,
-                      "a planned step charges one quantum and leaves the carry");
+    failures += check(prefill_step_quanta(false, 100, 2048, carried) == 1 && carried == 0,
+                      "a planned step charges one quantum and drops the carry");
 
-    // Against the projection, 1 + (prompt - 1) / chunk quanta: any mix of planned steps (the
-    // chunk, or the rest of the prompt) and steps cut to a multiple of 128 from 512 up to below
-    // the planned step, which therefore never ends the prompt, charges at least one and never more.
+    // Two 1025-token segments, each a 1024-token cut step and a planned one-token step to its
+    // capture frontier: the projection is one quantum per segment. A carry kept across the first
+    // segment's planned step would make the second segment's cut step charge a third.
+    carried = 0;
+    const std::uint64_t segments = prefill_step_quanta(true, 1024, 2048, carried) +
+                                   prefill_step_quanta(false, 1, 2048, carried) +
+                                   prefill_step_quanta(true, 1024, 2048, carried) +
+                                   prefill_step_quanta(false, 1, 2048, carried);
+    failures += check(segments == 2, "a planned step must end its segment's carry");
+
+    // Against the projection, 1 + (segment - 1) / chunk quanta for each segment a capture frontier
+    // ends: any mix of planned steps (the chunk, or the rest of the prompt or of the segment) and
+    // steps cut to a multiple of 128 from 512 up to below the planned step, which therefore never
+    // ends the prompt, charges at least one and never more. Whether a step is cut changes from
+    // step to step, as other lanes start and stop generating; a cut step that reaches a frontier
+    // counts as cut, as the Engine counts it.
     std::mt19937 random(170);
     bool within = true;
-    for (int trial = 0; trial < 20'000 && within; ++trial) {
+    for (int trial = 0; trial < 50'000 && within; ++trial) {
         const std::uint32_t chunk  = 512U * (2U + random() % 7U) + 128U * (random() % 4U);
         const std::uint32_t prompt = 1U + random() % (8U * chunk);
-        std::uint32_t left = prompt, held = 0;
-        std::uint64_t charged = 0;
-        while (left != 0) {
-            const std::uint32_t planned = std::min(left, chunk);
-            const std::uint32_t cuts    = planned > 512U ? (planned - 513U) / 128U + 1U : 0U;
-            const bool cut              = cuts != 0 && random() % 2U == 0U;
-            const std::uint32_t tokens  = cut ? 512U + 128U * (random() % cuts) : planned;
-            charged += prefill_step_quanta(cut, tokens, chunk, held);
-            left -= tokens;
+        std::vector<std::uint32_t> frontiers;
+        for (std::uint32_t count = random() % 4U; count != 0; --count) {
+            if (prompt > 1U) { frontiers.push_back(1U + random() % (prompt - 1U)); }
         }
-        within = charged >= 1 && charged <= 1ULL + (prompt - 1ULL) / chunk;
+        std::sort(frontiers.begin(), frontiers.end());
+        frontiers.erase(std::unique(frontiers.begin(), frontiers.end()), frontiers.end());
+        frontiers.push_back(prompt);
+        std::uint64_t projected = 0;
+        std::uint32_t begin     = 0;
+        for (const std::uint32_t frontier : frontiers) {
+            projected += 1ULL + (frontier - begin - 1ULL) / chunk;
+            begin = frontier;
+        }
+        std::uint32_t position = 0, held = 0;
+        std::uint64_t charged  = 0;
+        std::size_t segment    = 0;
+        while (position != prompt) {
+            const std::uint32_t planned = std::min(prompt - position, chunk);
+            const std::uint32_t cuts    = planned > 512U ? (planned - 513U) / 128U + 1U : 0U;
+            const std::uint32_t cap =
+                cuts != 0 && random() % 2U == 0U ? 512U + 128U * (random() % cuts) : 0U;
+            const std::uint32_t tokens =
+                std::min(cap != 0 ? cap : planned, frontiers[segment] - position);
+            charged += prefill_step_quanta(cap != 0 && tokens < planned, tokens, chunk, held);
+            position += tokens;
+            if (position == frontiers[segment]) { ++segment; }
+        }
+        within = charged >= 1 && charged <= projected;
     }
     failures += check(within, "a prompt's steps must not charge more than its planned steps");
 

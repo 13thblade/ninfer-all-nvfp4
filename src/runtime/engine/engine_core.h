@@ -112,7 +112,9 @@ public:
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
           context_cache_enabled_(options.context_cache.enabled),
-          prefill_chunk_(std::max<std::uint32_t>(options.prefill_chunk, 1)),
+          // The Program's step, which may differ from the requested chunk: pacing and the
+          // charges of cut steps use the unit the service projection counts.
+          prefill_chunk_(std::max<std::uint32_t>(instance.program->prefill_chunk(), 1)),
           pacing_(options.prefill_stall_budget_ms, context_cost),
           resources_(make_resource_manager(options, std::move(context_cost))),
           suspend_options_(options.suspend) {

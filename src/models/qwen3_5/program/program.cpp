@@ -465,6 +465,8 @@ Program::prefill_batch_unit(SequenceHandle sequence) const noexcept {
     return impl_->prefill_batch_unit(sequence);
 }
 
+std::uint32_t Program::prefill_chunk() const noexcept { return impl_->prefill_chunk; }
+
 std::uint32_t Program::prefill_batch_capacity() const noexcept { return impl_->prefill_chunk; }
 
 std::uint32_t Program::prefill_batch_segments() const noexcept {

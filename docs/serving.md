@@ -2178,10 +2178,10 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `600000` |
 | `--recover-invariant-failures` | a broken internal invariant in the Engine worker fails the active and materializing requests and leaves the waiting ones queued, as recovery from out of memory does, instead of failing the Engine; eight consecutive recoveries without a completed unit still fail it | off |
-| `--prefill-chunk N` | text-prefill chunk | `1024`; `4096` for native MoE experts in host memory or files |
+| `--prefill-chunk N` | text-prefill chunk; with an `int8` or `rk*` KV cache a Qwen3.5-core model runs the nearby multiple of 128 that best fills the GPU's prompt-attention waves, up to 256 tokens more (see [device profiles](device-profiles.md)) | `1024`; `4096` for native MoE experts in host memory or files |
 | `--decode-rounds-per-prefill N` | Decode rounds that run before each prefill chunk while other requests generate, so a long prompt does not leave them one token per chunk; proportionally fewer, at least one, before a shorter prefill unit, so a short prompt gets in after one round; `1` alternates strictly, a larger value keeps streams responsive and makes the prompt finish later | `0` (`--prefill-chunk` / 64) |
 | `--prefill-stall-budget-ms N` | While other requests generate, cut each prefill step to the largest multiple of 128 tokens, at least 512, that the prefill cost model predicts to take at most N ms; the model's costs are scaled by the ratio of observed to predicted step times. Every token of the other streams then waits about N ms instead of a whole chunk, and the new prompt prefills slower; a lone prompt keeps the whole chunk. Qwen3.5-family models only | `0` (off) |
-| `--fast-prefill-kernel` | prefill an `int8` or `rk*` KV cache with the fast prompt-attention kernel (FP16 PV accumulation per 64-key tile) and round `--prefill-chunk` down to whole attention waves; on Blackwell, prefill an `nvfp4` KV cache past 2048 visible keys with its fast kernel (QK on block-scaled FP4 Tensor Cores); a small perplexity cost (see [perplexity](perplexity.md)). Without the flag the [device profile](device-profiles.md)'s `attn_prompt_fast` decides, and the built-in profiles turn the kernel on where it measured faster | the device profile |
+| `--fast-prefill-kernel` | prefill an `int8` or `rk*` KV cache with the fast prompt-attention kernel (FP16 PV accumulation per 64-key tile); on Blackwell, prefill an `nvfp4` KV cache past 2048 visible keys with its fast kernel (QK on block-scaled FP4 Tensor Cores); a small perplexity cost (see [perplexity](perplexity.md)). Without the flag the [device profile](device-profiles.md)'s `attn_prompt_fast` decides, and the built-in profiles turn the kernel on where it measured faster | the device profile |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--log-colours on\|off` | `on` colours the console log's levels and gives every statistic of the operational lines a stable colour; `off` keeps the log plain; a redirected stderr is always plain | levels coloured on a console |
 | `--log-stats-panel on\|off` | pin the session statistics panel beneath the console log on an interactive terminal | off |
@@ -2749,20 +2749,29 @@ lets every configured lane be admitted at the same time. Once its prompt is prep
 finds the largest output whose admission entitlement -- Main KV pages for the prompt and output,
 plus the MTP draft-window or DFlash backend KV pages when speculation is on -- fits one lane's share
 (`1/--max-concurrency`) of each KV pool, and clamps it to the remaining context
-(`--max-context` minus the prompt). With one lane, or a pool of at least `--max-concurrency` times
-`--max-context`, that is the whole remaining context, so long reasoning runs are not cut at an
-arbitrary count; with several lanes over a smaller pool, each limitless request stays inside its
-share and they all run concurrently. A prompt that alone overruns one lane's share can never run
-beside full-share lanes, so it keeps the whole remaining context.
+(`--max-context` minus the prompt). With the prefix cache on, a Qwen3.5-core lane also keeps pages
+of its share free for the cache's snapshot copies: one per snapshot a request may capture (the
+hybrid cache's `--cache-taps-per-request`, 8 with a Host tier; the catalog's 7 prompt candidates)
+plus one. A snapshot whose frontier falls inside a 64-token page copies that page, and a repeat of
+the prompt that resumes there keeps the copy pinned while it takes its own. Neither page is part of
+a request's entitlement, so an entitlement that fills the pool leaves a repeated prompt no such
+snapshot to resume from. With one lane, or a pool of at least `--max-concurrency` times
+`--max-context` plus those pages, the budget is the whole remaining context, so long reasoning runs
+are not cut at an arbitrary count; with one lane and `--kv-capacity` equal to `--max-context` it is
+the remaining context less those pages (576 tokens with a Host tier). With several lanes over a
+smaller pool, each limitless request stays inside its share and they all run concurrently. A prompt
+that leaves no output beside the spare pages is sized without them, and one that alone overruns one
+lane's share can never run beside full-share lanes, so it keeps the whole remaining context.
 
 A run that exhausts the budget finishes with `finish_reason:"length"`, Responses `incomplete` with
 reason `max_output_tokens`, or Anthropic `stop_reason:"max_tokens"`, or
 `stop_reason:"model_context_window_exceeded"` when the budget was the remaining context. An explicit
-request limit always wins, and `--default-max-tokens N` replaces the derived default with a fixed cap
-(still bounded by the remaining context). Chat Completions `max_tokens: -1`, llama.cpp's "no limit"
-that its WebUI sends by default, always receives the derived budget, even with
-`--default-max-tokens`. The JSONL request record reports the budget actually
-submitted as `requested_output_tokens`.
+request limit always wins, and `--default-max-tokens N` replaces the derived default with a fixed
+cap (still bounded by the remaining context). An explicit limit whose entitlement fills the pool
+runs, but publishes no snapshot inside a page and resumes from none. Chat Completions
+`max_tokens: -1`, llama.cpp's "no limit" that its WebUI sends by default, always receives the
+derived budget, even with `--default-max-tokens`. The JSONL request record reports the budget actually submitted as
+`requested_output_tokens`.
 
 Each reusable checkpoint contains KV and complete continuation state. At admission, capture, and
 finish boundaries, resource pressure may keep it on Device, move its StateImage and/or KV replicas

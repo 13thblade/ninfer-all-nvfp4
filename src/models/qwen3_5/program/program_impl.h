@@ -841,6 +841,9 @@ public:
     [[nodiscard]] detail::PhysicalResources admission_capacity() const noexcept;
     [[nodiscard]] KVEntitlementShape kv_entitlement_shape() const noexcept;
     [[nodiscard]] std::uint32_t concurrent_output_budget(std::uint32_t prompt_tokens) const noexcept;
+    // Pages of each KV pool the derived output budget leaves beside one lane's entitlement for the
+    // prefix cache's tail copies.
+    [[nodiscard]] KVPageEntitlement prefix_cache_copy_headroom() const noexcept;
     [[nodiscard]] bool isolated_request_feasible(const RequestBasePlan& base) const noexcept;
 
     [[nodiscard]] bool hybrid_prefix_cache() const noexcept { return hybrid_ != nullptr; }

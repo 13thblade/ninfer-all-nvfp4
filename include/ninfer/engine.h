@@ -175,9 +175,13 @@ public:
 
     // The largest requested_output_tokens for this prompt whose admission entitlement -- Main KV
     // plus any MTP/DFlash backend KV, draft window included -- fits one lane's share of each pool,
-    // so every lane of max_concurrency can hold such a request at the same time. Clamped to the
-    // remaining context; with one lane that is the remaining context itself. A prompt that alone
-    // exceeds a lane's share receives the remaining context. Generation Engines only.
+    // so every lane of max_concurrency can hold such a request at the same time. With the context
+    // cache enabled, a Qwen3.5-core lane also leaves its share a page per snapshot a request may
+    // capture plus one, which the cache's snapshot tails take. Clamped to the remaining context;
+    // with one lane and a pool at least those pages beyond max_context, that is the remaining
+    // context itself. A prompt that leaves no output beside the spare pages is sized without them,
+    // and one that alone exceeds a lane's share receives the remaining context. Generation Engines
+    // only.
     [[nodiscard]] std::uint32_t concurrent_output_budget(const PreparedPrompt& prompt) const;
 
     GenerationResult generate(PreparedPrompt prompt, RequestOptions options,

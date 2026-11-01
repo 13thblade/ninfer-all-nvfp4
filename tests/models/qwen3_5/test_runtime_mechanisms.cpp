@@ -578,36 +578,46 @@ void test_rebuild_work_prompt_frontier_boundary() {
 
 // Independent oracle: the largest output in [1, remaining] whose reserved tokens -- prompt plus
 // output minus the unwritten last token, plus MTP's draft window up to the context -- fit a lane's
-// share of each pool in whole 64-token pages, found by a linear scan.
+// share of each pool in whole 64-token pages beside the headroom pages, found by a linear scan;
+// without the headroom when no output fits beside it.
 std::uint32_t scanned_budget(std::uint32_t capacity, std::uint32_t draft_window,
                              ninfer::SpeculativeBackend backend, std::uint32_t main_share,
-                             std::uint32_t backend_share, std::uint32_t prompt) {
+                             std::uint32_t backend_share, std::uint32_t prompt,
+                             std::uint32_t main_headroom, std::uint32_t backend_headroom) {
     const auto pages = [](std::uint64_t tokens) { return (tokens + 63U) / 64U; };
     const std::uint32_t remaining = capacity - prompt + 1U;
-    std::uint32_t best            = 0;
-    for (std::uint32_t output = 1; output <= remaining; ++output) {
-        const std::uint64_t reserved = std::uint64_t{prompt} + output - 1U;
-        std::uint64_t backend_tokens = 0;
-        if (backend == ninfer::SpeculativeBackend::Mtp) {
-            backend_tokens = std::min<std::uint64_t>(capacity, reserved + draft_window - 1U);
-        } else if (backend == ninfer::SpeculativeBackend::DFlash) {
-            backend_tokens = reserved;
+    const auto scan = [&](std::uint32_t main_spare, std::uint32_t backend_spare) {
+        std::uint32_t best = 0;
+        for (std::uint32_t output = 1; output <= remaining; ++output) {
+            const std::uint64_t reserved = std::uint64_t{prompt} + output - 1U;
+            std::uint64_t backend_tokens = 0;
+            if (backend == ninfer::SpeculativeBackend::Mtp) {
+                backend_tokens = std::min<std::uint64_t>(capacity, reserved + draft_window - 1U);
+            } else if (backend == ninfer::SpeculativeBackend::DFlash) {
+                backend_tokens = reserved;
+            }
+            if (pages(reserved) + main_spare <= main_share &&
+                pages(backend_tokens) + backend_spare <= backend_share) {
+                best = output;
+            }
         }
-        if (pages(reserved) <= main_share && pages(backend_tokens) <= backend_share) {
-            best = output;
-        }
-    }
+        return best;
+    };
+    std::uint32_t best = scan(main_headroom, backend_headroom);
+    if (best == 0) { best = scan(0, 0); }
     return best == 0 ? remaining : best;
 }
 
 void test_concurrent_output_budget() {
     using ninfer::SpeculativeBackend;
     using q36::detail::KVEntitlementShape;
+    using q36::detail::KVPageEntitlement;
     struct Case {
         KVEntitlementShape shape;
         std::uint32_t main_share;
         std::uint32_t backend_share;
         std::uint32_t prompt;
+        KVPageEntitlement headroom;
         std::uint32_t expected;
         const char* what;
     };
@@ -616,40 +626,63 @@ void test_concurrent_output_budget() {
         .capacity = 2048, .draft_window = 4, .backend = SpeculativeBackend::Mtp};
     const KVEntitlementShape dflash{
         .capacity = 2048, .draft_window = 8, .backend = SpeculativeBackend::DFlash};
+    // Issue #178: one lane, --max-context = --kv-capacity = 229,376 (3,584 pages), DFlash2 (no
+    // backend pool), an 11,775-token prompt and the Hybrid cache's eight taps plus the resume page.
+    const KVEntitlementShape full_pool{.capacity = 229'376, .backend = SpeculativeBackend::None};
     const std::array cases{
         // One lane owning a 2048-token pool: exactly the remaining context.
-        Case{plain, 32, 0, 17, 2032, "one lane did not receive the remaining context"},
+        Case{plain, 32, 0, 17, {}, 2032, "one lane did not receive the remaining context"},
         // Two lanes share it: reserved prompt+output-1 must fit 16 pages (1024 tokens).
-        Case{plain, 16, 0, 17, 1008, "two lanes did not split the Main pool"},
-        Case{plain, 16, 0, 1024, 1, "a prompt filling its share left no single token"},
+        Case{plain, 16, 0, 17, {}, 1008, "two lanes did not split the Main pool"},
+        Case{plain, 16, 0, 1024, {}, 1, "a prompt filling its share left no single token"},
         // MTP's draft window reserves three tokens beyond the Main frontier.
-        Case{mtp, 16, 16, 17, 1005, "MTP draft reservation was not charged"},
+        Case{mtp, 16, 16, 17, {}, 1005, "MTP draft reservation was not charged"},
         // A smaller DFlash backend pool binds before the Main share.
-        Case{dflash, 16, 8, 17, 496, "the DFlash backend share did not bind"},
+        Case{dflash, 16, 8, 17, {}, 496, "the DFlash backend share did not bind"},
         // A prompt beyond one lane's share keeps the remaining context.
-        Case{plain, 16, 0, 1100, 949, "an over-share prompt did not keep the remaining context"},
+        Case{plain, 16, 0, 1100, {}, 949,
+             "an over-share prompt did not keep the remaining context"},
+        // The headroom stays free beside the entitlement: 23 of 32 pages.
+        Case{plain, 32, 0, 17, {.main_pages = 9}, 1456, "one lane did not leave the headroom"},
+        Case{full_pool, 3584, 0, 11'775, {.main_pages = 9}, 217'026,
+             "a full-pool lane did not leave the snapshot pages free"},
+        Case{full_pool, 3584, 0, 11'775, {}, 217'602,
+             "a full-pool lane without headroom did not keep the remaining context"},
+        // Each pool keeps its own headroom; here the backend's binds.
+        Case{mtp, 16, 16, 17, {.main_pages = 1, .backend_pages = 1}, 941,
+             "the MTP backend headroom was not charged"},
+        Case{dflash, 16, 8, 17, {.main_pages = 2, .backend_pages = 2}, 368,
+             "the DFlash backend headroom was not charged"},
+        // 16 prompt pages leave no output beside 3 spare pages of a 16-page share: sized without.
+        Case{plain, 16, 0, 1000, {.main_pages = 3}, 25,
+             "a prompt crowding out the headroom was not sized without it"},
     };
     for (const Case& value : cases) {
         const std::uint32_t budget = q36::detail::concurrent_output_budget(
-            value.shape, value.main_share, value.backend_share, value.prompt);
+            value.shape, value.main_share, value.backend_share, value.prompt, value.headroom);
         expect(budget == value.expected, value.what);
         expect(budget == scanned_budget(value.shape.capacity, value.shape.draft_window,
-                                        value.shape.backend, value.main_share,
-                                        value.backend_share, value.prompt),
+                                        value.shape.backend, value.main_share, value.backend_share,
+                                        value.prompt, value.headroom.main_pages,
+                                        value.headroom.backend_pages),
                value.what);
     }
-    expect(q36::detail::concurrent_output_budget(plain, 32, 0, 2049) == 0 &&
-               q36::detail::concurrent_output_budget(plain, 32, 0, 0) == 0,
+    expect(q36::detail::concurrent_output_budget(plain, 32, 0, 2049, {}) == 0 &&
+               q36::detail::concurrent_output_budget(plain, 32, 0, 0, {}) == 0,
            "an empty or over-context prompt received a budget");
-    // Agreement with the scan across prompts and odd shares.
+    // Agreement with the scan across prompts, odd shares and headrooms.
     for (const KVEntitlementShape& shape : {plain, mtp, dflash}) {
-        for (std::uint32_t prompt = 1; prompt <= 2048; prompt += 37) {
-            const std::uint32_t budget =
-                q36::detail::concurrent_output_budget(shape, 11, 7, prompt);
-            if (budget != scanned_budget(shape.capacity, shape.draft_window, shape.backend, 11, 7,
-                                         prompt)) {
-                expect(false, "concurrent output budget disagreed with the linear scan");
-                return;
+        for (const KVPageEntitlement headroom :
+             {KVPageEntitlement{}, KVPageEntitlement{.main_pages = 2, .backend_pages = 1}}) {
+            for (std::uint32_t prompt = 1; prompt <= 2048; prompt += 37) {
+                const std::uint32_t budget =
+                    q36::detail::concurrent_output_budget(shape, 11, 7, prompt, headroom);
+                if (budget != scanned_budget(shape.capacity, shape.draft_window, shape.backend, 11,
+                                             7, prompt, headroom.main_pages,
+                                             headroom.backend_pages)) {
+                    expect(false, "concurrent output budget disagreed with the linear scan");
+                    return;
+                }
             }
         }
     }

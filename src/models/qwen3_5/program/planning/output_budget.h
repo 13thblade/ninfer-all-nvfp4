@@ -44,19 +44,24 @@ kv_page_entitlement(const KVEntitlementShape& shape, std::uint32_t prompt_tokens
     return out;
 }
 
-// The largest output whose entitlement fits one lane's share of each pool (`*_share_pages` =
-// pool pages / lanes), clamped to the remaining context `capacity - prompt + 1`. A prompt that alone
-// overruns a lane's share can never run beside full-share lanes; it keeps the remaining context
-// rather than an arbitrary cut. Zero only for an empty or over-long prompt.
+// The largest output whose entitlement, beside `headroom` pages of each pool left free for the
+// prefix cache's copies, fits one lane's share of each pool (`*_share_pages` = pool pages / lanes),
+// clamped to the remaining context `capacity - prompt + 1`. A prompt that leaves no output beside
+// the headroom is sized without it. One that alone overruns a lane's share can never run beside
+// full-share lanes; it keeps the remaining context rather than an arbitrary cut. Zero only for an
+// empty or over-long prompt.
 [[nodiscard]] constexpr std::uint32_t
 concurrent_output_budget(const KVEntitlementShape& shape, std::uint32_t main_share_pages,
-                         std::uint32_t backend_share_pages, std::uint32_t prompt_tokens) noexcept {
+                         std::uint32_t backend_share_pages, std::uint32_t prompt_tokens,
+                         KVPageEntitlement headroom) noexcept {
     if (prompt_tokens == 0 || prompt_tokens > shape.capacity) { return 0; }
     const std::uint32_t remaining = shape.capacity - prompt_tokens + 1U;
     const auto fits = [&](std::uint32_t output) {
         const KVPageEntitlement need = kv_page_entitlement(shape, prompt_tokens, output);
-        return need.main_pages <= main_share_pages && need.backend_pages <= backend_share_pages;
+        return std::uint64_t{need.main_pages} + headroom.main_pages <= main_share_pages &&
+               std::uint64_t{need.backend_pages} + headroom.backend_pages <= backend_share_pages;
     };
+    if (!fits(1U)) { headroom = {}; }
     if (!fits(1U)) { return remaining; }
     // The entitlement is monotonic in the output, so the largest fitting budget is a bisection.
     std::uint32_t low  = 1U;

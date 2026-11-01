@@ -248,7 +248,24 @@ std::uint32_t ProgramImpl::concurrent_output_budget(std::uint32_t prompt_tokens)
     const std::uint32_t backend_share =
         backend != nullptr ? backend->page_pool().capacity_pages() / max_concurrency : 0U;
     return detail::concurrent_output_budget(kv_entitlement_shape(), main_share, backend_share,
-                                            prompt_tokens);
+                                            prompt_tokens, prefix_cache_copy_headroom());
+}
+
+KVPageEntitlement ProgramImpl::prefix_cache_copy_headroom() const noexcept {
+    if (!context_cache.enabled) { return {}; }
+    // A snapshot past a page boundary copies its partial last page into a page of its own, and a
+    // request resuming from it pins that page while it copies the tail into its entitlement.
+    // Neither page is part of an entitlement, so a lane whose entitlement fills its share captures
+    // no such snapshot and resumes from none: a repeated prompt prefills again. Leave one page per
+    // pool for the resume and one for each snapshot a request may capture: hybrid taps, or the
+    // catalog's shared captures, which the per-request candidate ceiling bounds (private anchors
+    // share the active's pages).
+    const std::uint32_t captures =
+        hybrid_ ? hybrid_->taps().max_new_taps
+                : static_cast<std::uint32_t>(kMaximumPreparedPromptCacheCandidatesPerRequest);
+    const std::uint32_t pages = captures + 1U;
+    return KVPageEntitlement{.main_pages    = pages,
+                             .backend_pages = backend_kv_cache() != nullptr ? pages : 0U};
 }
 
 namespace {
