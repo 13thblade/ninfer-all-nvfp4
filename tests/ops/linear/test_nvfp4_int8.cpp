@@ -412,6 +412,14 @@ int run_nvfp4_int8() {
                               {5120, k, seed, Comparison::SampledRows, true, invocations,
                                ActivationSigns::Centered, DType::FP32});
     }
+    // A share that does not divide its parent: --tensor-split sizes the ranks by measured
+    // bandwidth, so a rank of the 17,408-row gate/up or of the 17,408-column down holds an extent
+    // such as 5,888. The family still answers it -- the launcher aligns the extent, not a quotient.
+    failures += run_shape("NVFP4_Int8Grouped", ActivationCompute::Int8Grouped, make_nvfp4_weight,
+                          {5888, 5120, 817U, Comparison::SampledRows, true, invocations});
+    failures += run_shape("NVFP4_Int8Grouped", ActivationCompute::Int8Grouped, make_nvfp4_weight,
+                          {5120, 5888, 819U, Comparison::SampledRows, true, invocations,
+                           ActivationSigns::Centered, DType::FP32});
     failures += verify_fp32_partial_writer();
     failures += run_generic_geometries();
     failures += run_forced_padded_widths();

@@ -87,14 +87,16 @@ public:
         }
         if (p.weight.qtype != QType::NVFP4) { return; }
         const auto& w = p.weight;
-        // A rank binds the same projection at its share of the divided dimension: gate and up rows
-        // over the rank count, or down columns over it. Admit those as well as the whole shape --
-        // the family reads both dimensions at launch time and writes whichever dtype the result
-        // names, so a share is a shape it can serve. The alignment is the launcher's: rows a whole
-        // 128-tile, K a whole 64-group (four G16 blocks).
+        // A rank binds the same projection at its share of the divided dimension: gate and up rows,
+        // or down columns. Admit those as well as the whole shape -- the family reads both
+        // dimensions at launch time and writes whichever dtype the result names, so a share is a
+        // shape it can serve. The share need not divide the parent: --tensor-split sizes the ranks
+        // by measured bandwidth, so a share's extent is what the launcher aligns, not a quotient.
+        // The alignment is the launcher's: rows a whole 128-tile, K a whole 64-group (four G16
+        // blocks), which the loader's cuts already give every share.
         const bool whole        = w.n == n && w.k == k;
-        const bool column_share = w.k == k && w.n > 0 && w.n < n && (n % w.n) == 0;
-        const bool row_share    = w.n == n && w.k > 0 && w.k < k && (k % w.k) == 0;
+        const bool column_share = w.k == k && w.n > 0 && w.n < n;
+        const bool row_share    = w.n == n && w.k > 0 && w.k < k;
         if (!(whole || column_share || row_share)) { return; }
         if ((w.n % 128) != 0 || (w.k % 64) != 0) { return; }
         p.policy = ops::LinearPolicy::AllowNvfp4Int8;
